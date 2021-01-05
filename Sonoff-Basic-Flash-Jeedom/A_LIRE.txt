@@ -1,0 +1,3 @@
+Site Internet avec les explications :
+
+https://www.domo-blog.fr/comment-flasher-le-firmware-du-sonoff-basic-pour-lutiliser-sur-jeedom/
