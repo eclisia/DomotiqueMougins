@@ -15,7 +15,7 @@
 // After loading firmware, issue a 'reset' command to load the defaults.
 // --- Basic Config Settings ------------------------------------------------------------------------
 #ifndef DEFAULT_NAME
-#define DEFAULT_NAME        "ESP_Easy"          // Enter your device friendly name
+#define DEFAULT_NAME        "ESP_EasyFlorent"          // Enter your device friendly name
 #endif
 #ifndef UNIT
 #define UNIT                0                   // Unit Number
@@ -37,22 +37,22 @@
 
 // --- Wifi Client Mode -----------------------------------------------------------------------------
 #ifndef DEFAULT_SSID
-#define DEFAULT_SSID        "ssid"              // Enter your Wifi network SSID
+#define DEFAULT_SSID        "Livebox-7DFC"              // Enter your Wifi network SSID
 #endif
 #ifndef DEFAULT_KEY
-#define DEFAULT_KEY         "wpakey"            // Enter your Wifi network WPA key
+#define DEFAULT_KEY         "xAY6oVdkkWqwfjfxEe"            // Enter your Wifi network WPA key
 #endif
 #ifndef DEFAULT_USE_STATIC_IP
-#define DEFAULT_USE_STATIC_IP   false           // (true|false) enabled or disabled static IP
+#define DEFAULT_USE_STATIC_IP   true           // (true|false) enabled or disabled static IP
 #endif
 #ifndef DEFAULT_IP
-#define DEFAULT_IP          "192.168.0.50"      // Enter your IP address
+#define DEFAULT_IP          "192.168.1.149"      // Enter your IP address
 #endif
 #ifndef DEFAULT_DNS
 #define DEFAULT_DNS         "192.168.0.1"       // Enter your DNS
 #endif
 #ifndef DEFAULT_GW
-#define DEFAULT_GW          "192.168.0.1"       // Enter your Gateway
+#define DEFAULT_GW          "192.168.1.1"       // Enter your Gateway
 #endif
 #ifndef DEFAULT_SUBNET
 #define DEFAULT_SUBNET      "255.255.255.0"     // Enter your Subnet
@@ -70,7 +70,7 @@
 #define DEFAULT_ADMIN_USERNAME  "admin"
 #endif
 #ifndef DEFAULT_ADMIN_PASS
-#define DEFAULT_ADMIN_PASS     ""
+#define DEFAULT_ADMIN_PASS     "admin"
 #endif
 
 #ifndef DEFAULT_WIFI_CONNECTION_TIMEOUT

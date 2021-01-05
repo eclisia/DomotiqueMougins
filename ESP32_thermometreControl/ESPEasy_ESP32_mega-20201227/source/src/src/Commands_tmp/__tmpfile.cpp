@@ -1,443 +1,673 @@
-#include "../Commands/UPD.h"
+#include "../Commands/Blynk.h"
+
+#include "../../ESPEasy_fdwdecl.h"
+#include "../Commands/Common.h"
+#include "../DataStructs/ESPEasy_EventStruct.h"
+#include "../ESPEasyCore/ESPEasy_Log.h"
+#include "../Globals/Protocol.h"
+#include "../Globals/Settings.h"
+#include "../Helpers/_CPlugin_Helper.h"
+#include "../Helpers/ESPEasy_Storage.h"
+#include "../Helpers/ESPEasy_time_calc.h"
+
+
+#ifdef USES_C012
+
+controllerIndex_t firstEnabledBlynk_ControllerIndex() {
+  for (controllerIndex_t i = 0; i < CONTROLLER_MAX; ++i) {
+    protocolIndex_t ProtocolIndex = getProtocolIndex_from_ControllerIndex(i);
+
+    if (validProtocolIndex(ProtocolIndex)) {
+      if ((Protocol[ProtocolIndex].Number == 12) && Settings.ControllerEnabled[i]) {
+        return i;
+      }
+    }
+  }
+  return INVALID_CONTROLLER_INDEX;
+}
+
+String Command_Blynk_Get(struct EventStruct *event, const char *Line)
+{
+  controllerIndex_t first_enabled_blynk_controller = firstEnabledBlynk_ControllerIndex();
+
+  if (!validControllerIndex(first_enabled_blynk_controller)) {
+    return F("Controller not enabled");
+  } else {
+    // FIXME TD-er: This one is not using parseString* function
+    String strLine = Line;
+    strLine = strLine.substring(9);
+    int index = strLine.indexOf(',');
+
+    if (index > 0)
+    {
+      int index           = strLine.lastIndexOf(',');
+      String blynkcommand = strLine.substring(index + 1);
+      float  value        = 0;
+
+      if (Blynk_get(blynkcommand, first_enabled_blynk_controller, &value))
+      {
+        UserVar[(VARS_PER_TASK * (event->Par1 - 1)) + event->Par2 - 1] = value;
+      }
+      else {
+        return F("Error getting data");
+      }
+    }
+    else
+    {
+      if (!Blynk_get(strLine, first_enabled_blynk_controller, nullptr))
+      {
+        return F("Error getting data");
+      }
+    }
+  }
+  return return_command_success();
+}
+
+bool Blynk_get(const String& command, controllerIndex_t controllerIndex, float *data)
+{
+  bool MustCheckReply = false;
+  String hostname, pass;
+  unsigned int ClientTimeout = 0;
+  WiFiClient client;
+
+  {
+    // Place ControllerSettings in its own scope, as it is quite big.
+    MakeControllerSettings(ControllerSettings);
+    if (!AllocatedControllerSettings()) {
+      addLog(LOG_LEVEL_ERROR, F("Blynk : Cannot run GET, out of RAM"));
+      return false;
+    }
+
+    LoadControllerSettings(controllerIndex, ControllerSettings);
+    MustCheckReply = ControllerSettings.MustCheckReply;
+    hostname = ControllerSettings.getHost();
+    pass = getControllerPass(controllerIndex, ControllerSettings);
+    ClientTimeout = ControllerSettings.ClientTimeout;
+
+    if (pass.length() == 0) {
+      addLog(LOG_LEVEL_ERROR, F("Blynk : No password set"));
+      return false;
+    }
+
+    if (!try_connect_host(/* CPLUGIN_ID_012 */ 12, client, ControllerSettings)) {
+      return false;
+    }
+  }
+
+  // We now create a URI for the request
+  {
+    // Place this stack allocated array in its own scope, as it is quite big.
+    char request[300] = { 0 };
+    sprintf_P(request,
+              PSTR("GET /%s/%s HTTP/1.1\r\n Host: %s \r\n Connection: close\r\n\r\n"),
+              pass.c_str(),
+              command.c_str(),
+              hostname.c_str());
+    addLog(LOG_LEVEL_DEBUG, request);
+    client.print(request);
+  }
+  bool success = !MustCheckReply;
+
+  if (MustCheckReply || data) {
+    unsigned long timer = millis() + 200;
+
+    while (!client_available(client) && !timeOutReached(timer)) {
+      delay(1);
+    }
+
+    char log[80] = { 0 };
+    timer = millis() + 1500;
+
+    // Read all the lines of the reply from server and log them
+    while (client_available(client) && !success && !timeOutReached(timer)) {
+      String line;
+      safeReadStringUntil(client, line, '\n');
+      addLog(LOG_LEVEL_DEBUG_MORE, line);
+
+      // success ?
+      if (line.substring(0, 15) == F("HTTP/1.1 200 OK")) {
+        strcpy_P(log, PSTR("HTTP : Success"));
+
+        if (!data) { success = true; }
+      }
+      else if (line.substring(0, 24) == F("HTTP/1.1 400 Bad Request")) {
+        strcpy_P(log, PSTR("HTTP : Unauthorized"));
+      }
+      else if (line.substring(0, 25) == F("HTTP/1.1 401 Unauthorized")) {
+        strcpy_P(log, PSTR("HTTP : Unauthorized"));
+      }
+      addLog(LOG_LEVEL_DEBUG, log);
+
+      // data only
+      if (data && line.startsWith("["))
+      {
+        String strValue = line;
+        byte   pos      = strValue.indexOf('"', 2);
+        strValue = strValue.substring(2, pos);
+        strValue.trim();
+        float value = strValue.toFloat();
+        *data   = value;
+        success = true;
+
+        char value_char[5] = { 0 };
+        strValue.toCharArray(value_char, 5);
+        sprintf_P(log, PSTR("Blynk get - %s => %s"), command.c_str(), value_char);
+        addLog(LOG_LEVEL_DEBUG, log);
+      }
+      delay(0);
+    }
+  }
+  addLog(LOG_LEVEL_DEBUG, F("HTTP : closing connection (012)"));
+
+  client.flush();
+  client.stop();
+
+  // important - backgroundtasks - free mem
+  unsigned long timer = millis() + ClientTimeout;
+
+  while (!timeOutReached(timer)) {
+    backgroundtasks();
+  }
+
+  return success;
+}
+
+#endif // ifdef USES_C012
+
+#include "../Commands/Common.h"
+
+#include <ctype.h>
+#include <IPAddress.h>
+
+#include "../../ESPEasy_common.h"
+
+#include "../DataStructs/ESPEasy_EventStruct.h"
+#include "../DataTypes/EventValueSource.h"
+
+#include "../ESPEasyCore/ESPEasyWifi.h"
+#include "../ESPEasyCore/Serial.h"
+
+#include "../Helpers/Numerical.h"
+#include "../Helpers/StringConverter.h"
+
+
+// Simple function to return "Ok", to avoid flash string duplication in the firmware.
+String return_command_success()
+{
+  return F("\nOk");
+}
+
+String return_command_failed()
+{
+  return F("\nFailed");
+}
+
+String return_incorrect_nr_arguments()
+{
+  return F("Too many arguments, try using quotes!");
+}
+
+String return_incorrect_source()
+{
+  return F("Command not allowed from this source!");
+}
+
+String return_not_connected()
+{
+  return F("Not connected to WiFi");
+}
+
+String return_result(struct EventStruct *event, const String& result)
+{
+  serialPrintln(result);
+
+  if (event->Source == EventValueSource::Enum::VALUE_SOURCE_SERIAL) {
+    return return_command_success();
+  }
+  return result;
+}
+
+String return_see_serial(struct EventStruct *event)
+{
+  if (event->Source == EventValueSource::Enum::VALUE_SOURCE_SERIAL) {
+    return return_command_success();
+  }
+  return F("Output sent to serial");
+}
+
+String Command_GetORSetIP(struct EventStruct *event,
+                          const String      & targetDescription,
+                          const char         *Line,
+                          byte               *IP,
+                          const IPAddress   & dhcpIP,
+                          int                 arg)
+{
+  bool hasArgument = false;
+  {
+    // Check if command is valid. Leave in separate scope to delete the TmpStr1
+    String TmpStr1;
+
+    if (GetArgv(Line, TmpStr1, arg + 1)) {
+      hasArgument = true;
+
+      if (!str2ip(TmpStr1, IP)) {
+        String result = F("Invalid parameter: ");
+        result += TmpStr1;
+        return return_result(event, result);
+      }
+    }
+  }
+
+  if (!hasArgument) {
+    serialPrintln();
+    String result = targetDescription;
+
+    if (useStaticIP()) {
+      result += formatIP(IP);
+    } else {
+      result += formatIP(dhcpIP);
+      result += F("(DHCP)");
+    }
+    return return_result(event, result);
+  }
+  return return_command_success();
+}
+
+String Command_GetORSetString(struct EventStruct *event,
+                              const String      & targetDescription,
+                              const char         *Line,
+                              char               *target,
+                              size_t              len,
+                              int                 arg
+                              )
+{
+  bool hasArgument = false;
+  {
+    // Check if command is valid. Leave in separate scope to delete the TmpStr1
+    String TmpStr1;
+
+    if (GetArgv(Line, TmpStr1, arg + 1)) {
+      hasArgument = true;
+
+      if (TmpStr1.length() > len) {
+        String result = targetDescription;
+        result += F(" is too large. max size is ");
+        result += len;
+        serialPrintln();
+        return return_result(event, result);
+      }
+      strcpy(target, TmpStr1.c_str());
+    }
+  }
+
+  if (hasArgument) {
+    serialPrintln();
+    String result = targetDescription;
+    result += target;
+    return return_result(event, result);
+  }
+  return return_command_success();
+}
+
+String Command_GetORSetBool(struct EventStruct *event,
+                            const String      & targetDescription,
+                            const char         *Line,
+                            bool               *value,
+                            int                 arg)
+{
+  bool hasArgument = false;
+  {
+    // Check if command is valid. Leave in separate scope to delete the TmpStr1
+    String TmpStr1;
+
+    if (GetArgv(Line, TmpStr1, arg + 1)) {
+      hasArgument = true;
+      TmpStr1.toLowerCase();
+
+      if (isInt(TmpStr1)) {
+        *value = atoi(TmpStr1.c_str()) > 0;
+      }
+      else if (strcmp_P(PSTR("on"), TmpStr1.c_str()) == 0) { *value = true; }
+      else if (strcmp_P(PSTR("true"), TmpStr1.c_str()) == 0) { *value = true; }
+      else if (strcmp_P(PSTR("off"), TmpStr1.c_str()) == 0) { *value = false; }
+      else if (strcmp_P(PSTR("false"), TmpStr1.c_str()) == 0) { *value = false; }
+    }
+  }
+
+  if (hasArgument) {
+    String result = targetDescription;
+    result += boolToString(*value);
+    return return_result(event, result);
+  }
+  return return_command_success();
+}
+
+String Command_GetORSetUint8_t(struct EventStruct *event,
+                            const String      & targetDescription,
+                            const char         *Line,
+                            uint8_t            *value,
+                            int                 arg)
+{
+  bool hasArgument = false;
+  {
+    // Check if command is valid. Leave in separate scope to delete the TmpStr1
+    String TmpStr1;
+
+    if (GetArgv(Line, TmpStr1, arg + 1)) {
+      hasArgument = true;
+      TmpStr1.toLowerCase();
+
+      if (isInt(TmpStr1)) {
+        *value = (uint8_t)atoi(TmpStr1.c_str());
+      }
+      else if (strcmp_P(PSTR("WIFI"), TmpStr1.c_str()) == 0) { *value = 0; }
+      else if (strcmp_P(PSTR("ETHERNET"), TmpStr1.c_str()) == 0) { *value = 1; }
+    }
+  }
+
+  if (hasArgument) {
+    String result = targetDescription;
+    result += *value;
+    return return_result(event, result);
+  }
+  return return_command_success();
+}
+
+String Command_GetORSetInt8_t(struct EventStruct *event,
+                            const String      & targetDescription,
+                            const char         *Line,
+                            int8_t             *value,
+                            int                 arg)
+{
+  bool hasArgument = false;
+  {
+    // Check if command is valid. Leave in separate scope to delete the TmpStr1
+    String TmpStr1;
+
+    if (GetArgv(Line, TmpStr1, arg + 1)) {
+      hasArgument = true;
+      TmpStr1.toLowerCase();
+
+      if (isInt(TmpStr1)) {
+        *value = (int8_t)atoi(TmpStr1.c_str());
+      }
+    }
+  }
+
+  if (hasArgument) {
+    String result = targetDescription;
+    result += *value;
+    return return_result(event, result);
+  }
+  return return_command_success();
+}
+
+#include "../Commands/Controller.h"
 
 
 #include "../../ESPEasy_common.h"
 
+
 #include "../Commands/Common.h"
-#include "../ESPEasyCore/ESPEasyNetwork.h"
-#include "../Globals/NetworkState.h"
-#include "../Globals/Settings.h"
+
+#include "../DataStructs/ESPEasy_EventStruct.h"
+
+#include "../DataTypes/ControllerIndex.h"
+
+#include "../Globals/CPlugins.h"
+
 #include "../Helpers/Misc.h"
-#include "../Helpers/Network.h"
-#include "../Helpers/Networking.h"
+
+//      controllerIndex = (event->Par1 - 1);   Par1 is here for 1 ... CONTROLLER_MAX
+bool validControllerVar(struct EventStruct *event, controllerIndex_t& controllerIndex)
+{
+  if (event->Par1 <= 0) { return false; }
+  controllerIndex = static_cast<controllerIndex_t>(event->Par1 - 1);
+  return validControllerIndex(controllerIndex);
+}
+
+String Command_Controller_Disable(struct EventStruct *event, const char *Line)
+{
+  controllerIndex_t controllerIndex;
+
+  if (validControllerVar(event, controllerIndex) && setControllerEnableStatus(controllerIndex, false)) {
+    return return_command_success();
+  }
+  return return_command_failed();
+}
+
+String Command_Controller_Enable(struct EventStruct *event, const char *Line)
+{
+  controllerIndex_t controllerIndex;
+
+  if (validControllerVar(event, controllerIndex) && setControllerEnableStatus(controllerIndex, true)) {
+    return return_command_success();
+  }
+  return return_command_failed();
+}
+
+#include "../Commands/Diagnostic.h"
+
+/*
+ #include "Common.h"
+ #include "../../ESPEasy_common.h"
+ 
+ #include "../DataStructs/ESPEasy_EventStruct.h"
+ */
+
+#include "../../ESPEasy_fdwdecl.h"
+
+#include "../Commands/Common.h"
+
+#include "../DataStructs/PortStatusStruct.h"
+
+#include "../DataTypes/SettingsType.h"
+
+#include "../ESPEasyCore/ESPEasy_Log.h"
+#include "../ESPEasyCore/Serial.h"
+
+#include "../Globals/Device.h"
+#include "../Globals/ExtraTaskSettings.h"
+#include "../Globals/GlobalMapPortStatus.h"
+#include "../Globals/SecuritySettings.h"
+#include "../Globals/Settings.h"
+#include "../Globals/Statistics.h"
+
+#include "../Helpers/Convert.h"
+#include "../Helpers/ESPEasy_Storage.h"
+#include "../Helpers/ESPEasy_time_calc.h"
+#include "../Helpers/Misc.h"
+#include "../Helpers/PortStatus.h"
 #include "../Helpers/StringConverter.h"
 #include "../Helpers/StringParser.h"
 
-String Command_UDP_Test(struct EventStruct *event, const char *Line)
+#include <map>
+#include <stdint.h>
+
+
+#ifndef BUILD_MINIMAL_OTA
+bool showSettingsFileLayout = false;
+#endif // ifndef BUILD_MINIMAL_OTA
+
+#ifndef BUILD_NO_DIAGNOSTIC_COMMANDS
+String Command_Lowmem(struct EventStruct *event, const char *Line)
 {
-  for (byte x = 0; x < event->Par2; x++)
-  {
-    String eventName = "Test ";
-    eventName += x;
-    SendUDPCommand(event->Par1, eventName.c_str(), eventName.length());
-  }
-  return return_command_success();
-}
+  String result;
 
-String Command_UDP_Port(struct EventStruct *event, const char *Line)
-{
-  return Command_GetORSetBool(event, F("UDPPort:"),
-                              Line,
-                              (bool *)&Settings.UDPPort,
-                              1);
-}
-
-String Command_UPD_SendTo(struct EventStruct *event, const char *Line)
-{
-  int destUnit = parseCommandArgumentInt(Line, 1);
-  if ((destUnit > 0) && (destUnit < 255))
-  {
-    String eventName = tolerantParseStringKeepCase(Line, 3);
-    SendUDPCommand(destUnit, eventName.c_str(), eventName.length());
-  }
-  return return_command_success();
-}
-
-String Command_UDP_SendToUPD(struct EventStruct *event, const char *Line)
-{
-  if (NetworkConnected()) {
-    String ip      = parseString(Line, 2);
-    int port    = parseCommandArgumentInt(Line, 2);
-
-    if (port < 0 || port > 65535) return return_command_failed();
-    // FIXME TD-er: This command is not using the tolerance setting
-    // tolerantParseStringKeepCase(Line, 4);
-    String message = parseStringToEndKeepCase(Line, 4);
-    IPAddress UDP_IP;
-
-    if (UDP_IP.fromString(ip)) {
-      portUDP.beginPacket(UDP_IP, port);
-      #if defined(ESP8266)
-      portUDP.write(message.c_str(),            message.length());
-      #endif // if defined(ESP8266)
-      #if defined(ESP32)
-      portUDP.write((uint8_t *)message.c_str(), message.length());
-      #endif // if defined(ESP32)
-      portUDP.endPacket();
-    }
-    return return_command_success();
-  }
-  return return_not_connected();
-}
-
-#include "../Commands/System.h"
-
-#include "../../ESPEasy_common.h"
-
-
-#include "../Commands/Common.h"
-
-#include "../Globals/Settings.h"
-
-#include "../Helpers/DeepSleep.h"
-#include "../Helpers/Misc.h"
-#include "../Helpers/Scheduler.h"
-
-String Command_System_NoSleep(struct EventStruct *event, const char* Line)
-{
-	if (event->Par1 > 0)
-		Settings.deepSleep_wakeTime = event->Par1; // set deep Sleep awake time
-	else Settings.deepSleep_wakeTime = 0;
-	return return_command_success();
-}
-
-String Command_System_deepSleep(struct EventStruct *event, const char* Line)
-{
-	if (event->Par1 >= 0) {
-		deepSleepStart(event->Par1); // call the second part of the function to avoid check and enable one-shot operation
-	}
-	return return_command_success();
-}
-
-String Command_System_Reboot(struct EventStruct *event, const char* Line)
-{
-	pinMode(0, INPUT);
-	pinMode(2, INPUT);
-	pinMode(15, INPUT);
-	reboot(ESPEasy_Scheduler::IntendedRebootReason_e::CommandReboot);
-	return return_command_success();
-}
-
-
-#include "../../ESPEasy_common.h"
-#include "../Globals/MQTT.h"
-
-#ifdef USES_MQTT
-
-
-
-#include "../Commands/Common.h"
-#include "../Commands/MQTT.h"
-
-#include "../ESPEasyCore/Controller.h"
-#include "../ESPEasyCore/ESPEasy_Log.h"
-
-#include "../Globals/CPlugins.h"
-#include "../Globals/ESPEasy_Scheduler.h"
-#include "../Globals/Settings.h"
-
-#include "../Helpers/ESPEasy_Storage.h"
-#include "../Helpers/PeriodicalActions.h"
-#include "../Helpers/Scheduler.h"
-#include "../Helpers/StringConverter.h"
-
-
-String Command_MQTT_Publish(struct EventStruct *event, const char *Line)
-{
-  // ToDo TD-er: Not sure about this function, but at least it sends to an existing MQTTclient
-  controllerIndex_t enabledMqttController = firstEnabledMQTT_ControllerIndex();
-
-  if (!validControllerIndex(enabledMqttController)) {
-    return F("No MQTT controller enabled");
-  }
-
-  // Command structure:  Publish,<topic>,<value>
-  String topic = parseStringKeepCase(Line, 2);
-  String value = tolerantParseStringKeepCase(Line, 3);
-  addLog(LOG_LEVEL_DEBUG, String(F("Publish: ")) + topic + value);
-
-  if ((topic.length() > 0) && (value.length() > 0)) {
-
-    bool mqtt_retainFlag;
-    {
-      // Place the ControllerSettings in a scope to free the memory as soon as we got all relevant information.
-      MakeControllerSettings(ControllerSettings);
-      if (!AllocatedControllerSettings()) {
-        String error = F("MQTT : Cannot publish, out of RAM");
-        addLog(LOG_LEVEL_ERROR, error);
-        return error;
-      }
-
-      LoadControllerSettings(enabledMqttController, ControllerSettings);
-      mqtt_retainFlag = ControllerSettings.mqtt_retainFlag();
-    }
-
-
-    // @giig1967g: if payload starts with '=' then treat it as a Formula and evaluate accordingly
-    // The evaluated value is already present in event->Par2
-    // FIXME TD-er: Is the evaluated value always present in event->Par2 ?
-    // Should it already be evaluated, or should we evaluate it now?
-
-    bool success = false;
-    if (value[0] != '=') {
-      success = MQTTpublish(enabledMqttController, topic.c_str(), value.c_str(), mqtt_retainFlag);
-    }
-    else {
-      success = MQTTpublish(enabledMqttController, topic.c_str(), String(event->Par2).c_str(), mqtt_retainFlag);
-    }
-    if (success) {
-      return return_command_success();
-    }
-  }
-  return return_command_failed();
-}
-
-
-boolean MQTTsubscribe(controllerIndex_t controller_idx, const char* topic, boolean retained)
-{
-  if (MQTTclient.subscribe(topic)) {
-    Scheduler.setIntervalTimerOverride(ESPEasy_Scheduler::IntervalTimer_e::TIMER_MQTT, 10); // Make sure the MQTT is being processed as soon as possible.
-    String log = F("Subscribed to: ");  log += topic;
-    addLog(LOG_LEVEL_INFO, log);
-    return true;
-  }
-  addLog(LOG_LEVEL_ERROR, F("MQTT : subscribe failed"));
-  return false;
-}
-
-String Command_MQTT_Subscribe(struct EventStruct *event, const char* Line)
-{
-  if (MQTTclient.connected() ) {
-    // ToDo TD-er: Not sure about this function, but at least it sends to an existing MQTTclient
-    controllerIndex_t enabledMqttController = firstEnabledMQTT_ControllerIndex();
-    if (validControllerIndex(enabledMqttController)) {
-      bool mqtt_retainFlag;
-      {
-        // Place the ControllerSettings in a scope to free the memory as soon as we got all relevant information.
-        MakeControllerSettings(ControllerSettings);
-        if (!AllocatedControllerSettings()) {
-          String error = F("MQTT : Cannot subscribe, out of RAM");
-          addLog(LOG_LEVEL_ERROR, error);
-          return error;
-        }
-        LoadControllerSettings(event->ControllerIndex, ControllerSettings);
-        mqtt_retainFlag = ControllerSettings.mqtt_retainFlag();
-      }
-
-      String eventName = Line;
-      String topic = eventName.substring(10);
-      if (!MQTTsubscribe(enabledMqttController, topic.c_str(), mqtt_retainFlag))
-         return_command_failed();
-      return_command_success();
-    }
-    return F("No MQTT controller enabled");
-  }
-  return return_not_connected();
-}
-
-
-#endif // ifdef USES_MQTT
-
-#include "../Commands/Timer.h"
-
-
-
-
-#include "../../ESPEasy_common.h"
-
-
-#include "../Commands/Common.h"
-
-#include "../ESPEasyCore/ESPEasy_Log.h"
-#include "../ESPEasyCore/ESPEasyRules.h"
-
-#include "../Globals/ESPEasy_Scheduler.h"
-
-#include "../Helpers/ESPEasy_time_calc.h"
-#include "../Helpers/Misc.h"
-#include "../Helpers/Scheduler.h"
-
-String command_setRulesTimer(int msecFromNow, int timerIndex, int recurringCount) {
-  if (msecFromNow < 0)
-  {
-    addLog(LOG_LEVEL_ERROR, F("TIMER: time must be positive"));
-  } else {
-    // start new timer when msecFromNow > 0
-    // Clear timer when msecFromNow == 0
-    if (Scheduler.setRulesTimer(msecFromNow, timerIndex, recurringCount))
-    { 
-      return return_command_success();
-    }
-  }
-  return return_command_failed();
-}
-
-String Command_Timer_Set(struct EventStruct *event, const char *Line)
-{
-  return command_setRulesTimer(
-    event->Par2 * 1000, // msec from now
-    event->Par1,        // timer index
-    0                   // recurringCount
-    );
-}
-
-String Command_Timer_Set_ms (struct EventStruct *event, const char* Line)
-{
-  return command_setRulesTimer(
-    event->Par2, // interval
-    event->Par1, // timer index
-    0            // recurringCount
-    );
-}
-
-String Command_Loop_Timer_Set (struct EventStruct *event, const char* Line)
-{
-  int recurringCount = event->Par3;
-  if (recurringCount == 0) {
-    // if the optional 3rd parameter is not given, set it to "run always"
-    recurringCount = -1;
-  }
-  return command_setRulesTimer(
-    event->Par2 * 1000, // msec from now
-    event->Par1,        // timer index
-    recurringCount
-    );
-}
-
-String Command_Loop_Timer_Set_ms (struct EventStruct *event, const char* Line)
-{
-  int recurringCount = event->Par3;
-  if (recurringCount == 0) {
-    // if the optional 3rd parameter is not given, set it to "run always"
-    recurringCount = -1;
-  }
-  return command_setRulesTimer(
-    event->Par2, // interval
-    event->Par1, // timer index
-    recurringCount
-    );
-}
-
-String Command_Timer_Pause(struct EventStruct *event, const char *Line)
-{
-  if (Scheduler.pause_rules_timer(event->Par1)) {
-    String eventName = F("Rules#TimerPause=");
-    eventName += event->Par1;
-    rulesProcessing(eventName); // TD-er: Process right now
-    return return_command_success();
-  }
-  return return_command_failed();
-}
-
-String Command_Timer_Resume(struct EventStruct *event, const char *Line)
-{
-  if (Scheduler.resume_rules_timer(event->Par1)) {
-    String eventName = F("Rules#TimerResume=");
-    eventName += event->Par1;
-    rulesProcessing(eventName); // TD-er: Process right now
-    return return_command_success();
-  }
-  return return_command_failed();
-}
-
-String Command_Delay(struct EventStruct *event, const char *Line)
-{
-  delayBackground(event->Par1);
-  return return_command_success();
-}
-
-#include "../Commands/Networks.h"
-
-#include "../../ESPEasy_common.h"
-#include "../Commands/Common.h"
-#include "../Globals/Settings.h"
-#include "../WebServer/AccessControl.h"
-
-
-#ifdef HAS_ETHERNET
-#include "ETH.h"
-#endif
-
-String Command_AccessInfo_Ls(struct EventStruct *event, const char* Line)
-{
-  String result = F("Allowed IP range : ");
-  result += describeAllowedIPrange();
+  result += lowestRAM;
+  result += F(" : ");
+  result += lowestRAMfunction;
   return return_result(event, result);
 }
 
-String Command_AccessInfo_Clear (struct EventStruct *event, const char* Line)
+String Command_Malloc(struct EventStruct *event, const char *Line)
 {
-  clearAccessBlock();
-  return Command_AccessInfo_Ls(event, Line);
+  char *ramtest;
+  int size = parseCommandArgumentInt(Line, 1);
+
+  ramtest = (char *)malloc(size);
+
+  if (ramtest == nullptr) { return return_command_failed(); }
+  free(ramtest);
+  return return_command_success();
 }
 
-String Command_DNS (struct EventStruct *event, const char* Line)
+String Command_SysLoad(struct EventStruct *event, const char *Line)
 {
-  return Command_GetORSetIP(event, F("DNS:"), Line, Settings.DNS,WiFi.dnsIP(0),1);
+  String result = toString(getCPUload(), 2);
+
+  result += F("% (LC=");
+  result += getLoopCountPerSec();
+  result += ')';
+  return return_result(event, result);
 }
 
-String Command_Gateway (struct EventStruct *event, const char* Line)
+String Command_SerialFloat(struct EventStruct *event, const char *Line)
 {
-  return Command_GetORSetIP(event, F("Gateway:"), Line, Settings.Gateway,WiFi.gatewayIP(),1);
+  pinMode(1, INPUT);
+  pinMode(3, INPUT);
+  delay(60000);
+  return return_command_success();
 }
 
-String Command_IP (struct EventStruct *event, const char* Line)
+String Command_MemInfo(struct EventStruct *event, const char *Line)
 {
-  return Command_GetORSetIP(event, F("IP:"), Line, Settings.IP,WiFi.localIP(),1);
+  serialPrint(F("SecurityStruct         | "));
+  serialPrintln(String(sizeof(SecuritySettings)));
+  serialPrint(F("SettingsStruct         | "));
+  serialPrintln(String(sizeof(Settings)));
+  serialPrint(F("ExtraTaskSettingsStruct| "));
+  serialPrintln(String(sizeof(ExtraTaskSettings)));
+  serialPrint(F("DeviceStruct           | "));
+  serialPrintln(String(Device.size()));
+  return return_see_serial(event);
 }
 
-String Command_Subnet (struct EventStruct *event, const char* Line)
+String Command_MemInfo_detail(struct EventStruct *event, const char *Line)
 {
-  return Command_GetORSetIP(event, F("Subnet:"), Line, Settings.Subnet,WiFi.subnetMask(),1);
+#ifndef BUILD_MINIMAL_OTA
+  showSettingsFileLayout = true;
+  Command_MemInfo(event, Line);
+
+  for (int st = 0; st < static_cast<int>(SettingsType::Enum::SettingsType_MAX); ++st) {
+    SettingsType::SettingsType::Enum settingsType = static_cast<SettingsType::Enum>(st);
+    int max_index, offset, max_size;
+    int struct_size = 0;
+    serialPrintln();
+    serialPrint(SettingsType::getSettingsTypeString(settingsType));
+    serialPrintln(F(" | start | end | max_size | struct_size"));
+    serialPrintln(F("--- | --- | --- | --- | ---"));
+    SettingsType::getSettingsParameters(settingsType, 0, max_index, offset, max_size, struct_size);
+
+    for (int i = 0; i < max_index; ++i) {
+      SettingsType::getSettingsParameters(settingsType, i, offset, max_size);
+      serialPrint(String(i));
+      serialPrint("|");
+      serialPrint(String(offset));
+      serialPrint("|");
+      serialPrint(String(offset + max_size - 1));
+      serialPrint("|");
+      serialPrint(String(max_size));
+      serialPrint("|");
+      serialPrintln(String(struct_size));
+    }
+  }
+  return return_see_serial(event);
+  #else
+  return return_command_failed();
+  #endif // ifndef BUILD_MINIMAL_OTA
 }
 
-#ifdef HAS_ETHERNET
-String Command_ETH_Phy_Addr (struct EventStruct *event, const char* Line)
+String Command_Background(struct EventStruct *event, const char *Line)
 {
-  return Command_GetORSetUint8_t(event, F("ETH_Phy_Addr:"), Line, (uint8_t*)&Settings.ETH_Phy_Addr,1);
+  unsigned long timer = millis() + parseCommandArgumentInt(Line, 1);
+
+  serialPrintln(F("start"));
+
+  while (!timeOutReached(timer)) {
+    backgroundtasks();
+  }
+  serialPrintln(F("end"));
+  return return_see_serial(event);
+}
+#endif // BUILD_NO_DIAGNOSTIC_COMMANDS
+
+String Command_Debug(struct EventStruct *event, const char *Line)
+{
+  if (HasArgv(Line, 2)) {
+    setLogLevelFor(LOG_TO_SERIAL, parseCommandArgumentInt(Line, 1));
+  } else  {
+    serialPrintln();
+    serialPrint(F("Serial debug level: "));
+    serialPrintln(String(Settings.SerialLogLevel));
+  }
+  return return_see_serial(event);
 }
 
-String Command_ETH_Pin_mdc (struct EventStruct *event, const char* Line)
+String Command_logentry(struct EventStruct *event, const char *Line)
 {
-  return Command_GetORSetInt8_t(event, F("ETH_Pin_mdc:"), Line, (int8_t*)&Settings.ETH_Pin_mdc,1);
+  // FIXME TD-er: Add an extra optional parameter to set log level.
+  addLog(LOG_LEVEL_INFO, tolerantParseStringKeepCase(Line, 2));
+  return return_command_success();
 }
 
-String Command_ETH_Pin_mdio (struct EventStruct *event, const char* Line)
+#ifndef BUILD_NO_DIAGNOSTIC_COMMANDS
+String Command_JSONPortStatus(struct EventStruct *event, const char *Line)
 {
-  return Command_GetORSetInt8_t(event, F("ETH_Pin_mdio:"), Line, (int8_t*)&Settings.ETH_Pin_mdio,1);
+  addLog(LOG_LEVEL_INFO, F("JSON Port Status: Command not implemented yet."));
+  return return_command_success();
 }
 
-String Command_ETH_Pin_power (struct EventStruct *event, const char* Line)
-{
-  return Command_GetORSetInt8_t(event, F("ETH_Pin_power:"), Line, (int8_t*)&Settings.ETH_Pin_power,1);
+void createLogPortStatus(std::map<uint32_t, portStatusStruct>::iterator it)
+{  
+  String log = F("PortStatus detail: ");
+
+  log += F("Port=");
+  log += getPortFromKey(it->first);
+  log += F(" State=");
+  log += it->second.state;
+  log += F(" Output=");
+  log += it->second.output;
+  log += F(" Mode=");
+  log += it->second.mode;
+  log += F(" Task=");
+  log += it->second.task;
+  log += F(" Monitor=");
+  log += it->second.monitor;
+  log += F(" Command=");
+  log += it->second.command;
+  log += F(" Init=");
+  log += it->second.init;
+  log += F(" PreviousTask=");
+  log += it->second.previousTask;
+  addLog(LOG_LEVEL_INFO, log);
 }
 
-String Command_ETH_Phy_Type (struct EventStruct *event, const char* Line)
+void debugPortStatus(std::map<uint32_t, portStatusStruct>::iterator it)
 {
-  return Command_GetORSetInt8_t(event, F("ETH_Phy_Type:"), Line, (int8_t*)&Settings.ETH_Phy_Type,1);
+  createLogPortStatus(it);
 }
 
-String Command_ETH_Clock_Mode (struct EventStruct *event, const char* Line)
-{
-  return Command_GetORSetUint8_t(event, F("ETH_Clock_Mode:"), Line, (uint8_t*)&Settings.ETH_Clock_Mode,1);
+void logPortStatus(const String& from) {
+  String log;
+
+  log  = F("PortStatus structure: Called from=");
+  log += from;
+  log += F(" Count=");
+  log += globalMapPortStatus.size();
+  addLog(LOG_LEVEL_INFO, log);
+
+  for (std::map<uint32_t, portStatusStruct>::iterator it = globalMapPortStatus.begin(); it != globalMapPortStatus.end(); ++it) {
+    debugPortStatus(it);
+  }
 }
 
-String Command_ETH_IP (struct EventStruct *event, const char* Line)
+String Command_logPortStatus(struct EventStruct *event, const char *Line)
 {
-  return Command_GetORSetIP(event, F("ETH_IP:"), Line, Settings.ETH_IP,ETH.localIP(),1);
+  logPortStatus("Rules");
+  return return_command_success();
 }
-
-String Command_ETH_Gateway (struct EventStruct *event, const char* Line)
-{
-  return Command_GetORSetIP(event, F("ETH_Gateway:"), Line, Settings.ETH_Gateway,ETH.gatewayIP(),1);
-}
-
-String Command_ETH_Subnet (struct EventStruct *event, const char* Line)
-{
-  return Command_GetORSetIP(event, F("ETH_Subnet:"), Line, Settings.ETH_Subnet,ETH.subnetMask(),1);
-}
-
-String Command_ETH_DNS (struct EventStruct *event, const char* Line)
-{
-  return Command_GetORSetIP(event, F("ETH_DNS:"), Line, Settings.ETH_DNS,ETH.dnsIP(),1);
-}
-
-String Command_ETH_Wifi_Mode (struct EventStruct *event, const char* Line)
-{
-  return Command_GetORSetUint8_t(event, F("NetworkMedium:"), Line, (uint8_t*)&Settings.NetworkMedium,1);
-}
-
-#endif
+#endif // BUILD_NO_DIAGNOSTIC_COMMANDS
 
 #include "../Commands/GPIO.h"
 
@@ -929,555 +1159,97 @@ bool getPluginIDAndPrefixAndType(char selection, pluginID_t &pluginID, String &l
 }
 */
 
-#include "../Commands/wd.h"
-
-
-#include "../Commands/Common.h"
-
-#include "../DataStructs/ESPEasy_EventStruct.h"
-
-#include "../ESPEasyCore/Serial.h"
-
-#include "../Helpers/StringConverter.h"
-
-
-String Command_WD_Config(EventStruct *event, const char* Line)
-{
-  Wire.beginTransmission(event->Par1);  // address
-  Wire.write(event->Par2);              // command
-  Wire.write(event->Par3);              // data
-  Wire.endTransmission();
-  return return_command_success();
-}
-
-String Command_WD_Read(EventStruct *event, const char* Line)
-{
-  Wire.beginTransmission(event->Par1);  // address
-  Wire.write(0x83);                     // command to set pointer
-  Wire.write(event->Par2);              // pointer value
-  Wire.endTransmission();
-  if ( Wire.requestFrom(static_cast<uint8_t>(event->Par1), static_cast<uint8_t>(1)) == 1 )
-  {
-    byte value = Wire.read();
-    serialPrintln();
-    String result = F("I2C Read address ");
-    result += formatToHex(event->Par1);
-    result += F(" Value ");
-    result += formatToHex(value);
-    return return_result(event, result);
-  }
-  return return_command_success();
-}
-
-#include "../Commands/Settings.h"
+#include "../Commands/HTTP.h"
 
 #include "../../ESPEasy_common.h"
 
 #include "../Commands/Common.h"
 
-#include "../ESPEasyCore/ESPEasyNetwork.h"
-#include "../ESPEasyCore/Serial.h"
+#include "../DataStructs/ControllerSettingsStruct.h"
+#include "../DataStructs/SettingsStruct.h"
 
-#include "../Globals/SecuritySettings.h"
-#include "../Globals/Settings.h"
-
-#include "../Helpers/ESPEasy_FactoryDefault.h"
-#include "../Helpers/ESPEasy_Storage.h"
-#include "../Helpers/Memory.h"
-#include "../Helpers/Misc.h"
-#include "../Helpers/StringConverter.h"
-
-
-String Command_Settings_Build(struct EventStruct *event, const char* Line)
-{
-	if (HasArgv(Line, 2)) {
-		Settings.Build = event->Par1;
-	} else {
-		serialPrintln();
-		String result = F("Build:");
-		result += Settings.Build;
-    return return_result(event, result);
-	}
-	return return_command_success();
-}
-
-String Command_Settings_Unit(struct EventStruct *event, const char* Line)
-{
-	if (HasArgv(Line, 2)) {
-		Settings.Unit = event->Par1;
-	}else  {
-		serialPrintln();
-		String result = F("Unit:");
-		result += Settings.Unit;
-    return return_result(event, result);
-	}
-	return return_command_success();
-}
-
-String Command_Settings_Name(struct EventStruct *event, const char* Line)
-{
-	return Command_GetORSetString(event, F("Name:"),
-				      Line,
-				      Settings.Name,
-				      sizeof(Settings.Name),
-				      1);
-}
-
-String Command_Settings_Password(struct EventStruct *event, const char* Line)
-{
-	return Command_GetORSetString(event, F("Password:"),
-				      Line,
-				      SecuritySettings.Password,
-				      sizeof(SecuritySettings.Password),
-				      1
-				      );
-}
-
-String Command_Settings_Save(struct EventStruct *event, const char* Line)
-{
-	SaveSettings();
-	return return_command_success();
-}
-
-String Command_Settings_Load(struct EventStruct *event, const char* Line)
-{
-	LoadSettings();
-	return return_command_success();
-}
-
-String Command_Settings_Print(struct EventStruct *event, const char* Line)
-{
-	serialPrintln();
-
-	serialPrintln(F("System Info"));
-	serialPrint(F("  IP Address    : ")); serialPrintln(NetworkLocalIP().toString());
-	serialPrint(F("  Build         : ")); serialPrintln(String((int)BUILD));
-	serialPrint(F("  Name          : ")); serialPrintln(Settings.Name);
-	serialPrint(F("  Unit          : ")); serialPrintln(String((int)Settings.Unit));
-	serialPrint(F("  WifiSSID      : ")); serialPrintln(SecuritySettings.WifiSSID);
-	serialPrint(F("  WifiKey       : ")); serialPrintln(SecuritySettings.WifiKey);
-	serialPrint(F("  WifiSSID2     : ")); serialPrintln(SecuritySettings.WifiSSID2);
-	serialPrint(F("  WifiKey2      : ")); serialPrintln(SecuritySettings.WifiKey2);
-	serialPrint(F("  Free mem      : ")); serialPrintln(String(FreeMem()));
-	return return_see_serial(event);
-}
-
-String Command_Settings_Reset(struct EventStruct *event, const char* Line)
-{
-	ResetFactory();
-	reboot(ESPEasy_Scheduler::IntendedRebootReason_e::ResetFactoryCommand);
-	return return_command_success();
-}
-
-#include "../Commands/Servo.h"
-
-#include "../Commands/Common.h"
-#include "../Commands/GPIO.h"
-#include "../DataStructs/EventStructCommandWrapper.h"
-#include "../DataStructs/PinMode.h"
-#include "../DataStructs/PortStatusStruct.h"
-#include "../ESPEasyCore/Controller.h"
-#include "../ESPEasyCore/ESPEasyGPIO.h"
 #include "../ESPEasyCore/ESPEasy_Log.h"
-#include "../Globals/GlobalMapPortStatus.h"
-#include "../Helpers/Hardware.h"
-#include "../Helpers/PortStatus.h"
+#include "../ESPEasyCore/ESPEasyNetwork.h"
 
-// Needed also here for PlatformIO's library finder as the .h file 
-// is in a directory which is excluded in the src_filter
-#ifdef USE_SERVO
-# ifdef ESP32
-#  include <Servo.h>
-# endif // ifdef ESP32
-#endif
-
-#ifdef USE_SERVO
-ServoPinMap_t ServoPinMap;
-#endif // ifdef USE_SERVO
-
-String Command_Servo(struct EventStruct *event, const char *Line)
-{
-#ifdef USE_SERVO
-
-  // GPIO number is stored inside event->Par2 instead of event->Par1 as in all the other commands
-  // So needs to reload the tempPortStruct.
-
-  // FIXME TD-er: For now only fixed to "P001" even when it is for internal GPIO pins
-  pluginID_t pluginID = PLUGIN_GPIO;
-
-  // Par1: Servo ID (obsolete/unused since 2020/11/22)
-  // Par2: GPIO pin
-  // Par3: angle 0...180 degree
-  if (checkValidPortRange(pluginID, event->Par2)) {
-    portStatusStruct tempStatus;
-    const uint32_t   key = createKey(pluginID, event->Par2); // WARNING: 'servo' uses Par2 instead of Par1
-    // WARNING: operator [] creates an entry in the map if key does not exist
-    // So the next command should be part of each command:
-    tempStatus = globalMapPortStatus[key];
-
-    String log = F("Servo : GPIO ");
-    log += event->Par2;
-
-    // SPECIAL CASE TO ALLOW SERVO TO BE DETATTCHED AND SAVE POWER.
-    if (event->Par3 >= 9000) {
-      auto it = ServoPinMap.find(event->Par2);
-
-      if (it != ServoPinMap.end()) {
-        it->second.detach();
-        # ifdef ESP32
-          detachLedChannel(event->Par2);
-        # endif // ifdef ESP32
-        ServoPinMap.erase(it);
-      }
-
-      // Set parameters to make sure the port status will be removed.
-      tempStatus.task    = 0;
-      tempStatus.monitor = 0;
-      tempStatus.command = 0;
-      savePortStatus(key, tempStatus);
-      log += F(" Servo detached");
-      addLog(LOG_LEVEL_INFO, log);
-      return return_command_success();
-
-    }
-    # ifdef ESP32
-      // Must keep track of used channels or else cause conflicts with PWM
-      int8_t ledChannel = attachLedChannel(event->Par2);
-      ServoPinMap[event->Par2].attach(event->Par2, ledChannel);
-    # else // ifdef ESP32
-      ServoPinMap[event->Par2].attach(event->Par2);
-    # endif // ifdef ESP32
-    ServoPinMap[event->Par2].write(event->Par3);
-
-    tempStatus.command   = 1; // set to 1 in order to display the status in the PinStatus page
-    tempStatus.state     = 1;
-    tempStatus.output    = 1;
-    tempStatus.dutyCycle = event->Par3;
-
-    // setPinState(PLUGIN_ID_001, event->Par2, PIN_MODE_SERVO, event->Par3);
-    tempStatus.mode = PIN_MODE_SERVO;
-    savePortStatus(key, tempStatus);
-    log += F(" Servo set to ");
-    log += event->Par3;
-    addLog(LOG_LEVEL_INFO, log);
-    SendStatusOnlyIfNeeded(event->Source, SEARCH_PIN_STATE, key, log, 0);
-
-    // SendStatus(event->Source, getPinStateJSON(SEARCH_PIN_STATE, PLUGIN_ID_001, event->Par2, log, 0));
-    return return_command_success();
-  }
-    #else // ifdef USE_SERVO
-  addLog(LOG_LEVEL_ERROR, F("USE_SERVO not included in build"));
-    #endif // USE_SERVO
-  return return_command_failed();
-}
-
-#include "../Commands/Common.h"
-
-#include <ctype.h>
-#include <IPAddress.h>
-
-#include "../../ESPEasy_common.h"
-
-#include "../DataStructs/ESPEasy_EventStruct.h"
-#include "../DataTypes/EventValueSource.h"
-
-#include "../ESPEasyCore/ESPEasyWifi.h"
-#include "../ESPEasyCore/Serial.h"
-
-#include "../Helpers/Numerical.h"
-#include "../Helpers/StringConverter.h"
-
-
-// Simple function to return "Ok", to avoid flash string duplication in the firmware.
-String return_command_success()
-{
-  return F("\nOk");
-}
-
-String return_command_failed()
-{
-  return F("\nFailed");
-}
-
-String return_incorrect_nr_arguments()
-{
-  return F("Too many arguments, try using quotes!");
-}
-
-String return_incorrect_source()
-{
-  return F("Command not allowed from this source!");
-}
-
-String return_not_connected()
-{
-  return F("Not connected to WiFi");
-}
-
-String return_result(struct EventStruct *event, const String& result)
-{
-  serialPrintln(result);
-
-  if (event->Source == EventValueSource::Enum::VALUE_SOURCE_SERIAL) {
-    return return_command_success();
-  }
-  return result;
-}
-
-String return_see_serial(struct EventStruct *event)
-{
-  if (event->Source == EventValueSource::Enum::VALUE_SOURCE_SERIAL) {
-    return return_command_success();
-  }
-  return F("Output sent to serial");
-}
-
-String Command_GetORSetIP(struct EventStruct *event,
-                          const String      & targetDescription,
-                          const char         *Line,
-                          byte               *IP,
-                          const IPAddress   & dhcpIP,
-                          int                 arg)
-{
-  bool hasArgument = false;
-  {
-    // Check if command is valid. Leave in separate scope to delete the TmpStr1
-    String TmpStr1;
-
-    if (GetArgv(Line, TmpStr1, arg + 1)) {
-      hasArgument = true;
-
-      if (!str2ip(TmpStr1, IP)) {
-        String result = F("Invalid parameter: ");
-        result += TmpStr1;
-        return return_result(event, result);
-      }
-    }
-  }
-
-  if (!hasArgument) {
-    serialPrintln();
-    String result = targetDescription;
-
-    if (useStaticIP()) {
-      result += formatIP(IP);
-    } else {
-      result += formatIP(dhcpIP);
-      result += F("(DHCP)");
-    }
-    return return_result(event, result);
-  }
-  return return_command_success();
-}
-
-String Command_GetORSetString(struct EventStruct *event,
-                              const String      & targetDescription,
-                              const char         *Line,
-                              char               *target,
-                              size_t              len,
-                              int                 arg
-                              )
-{
-  bool hasArgument = false;
-  {
-    // Check if command is valid. Leave in separate scope to delete the TmpStr1
-    String TmpStr1;
-
-    if (GetArgv(Line, TmpStr1, arg + 1)) {
-      hasArgument = true;
-
-      if (TmpStr1.length() > len) {
-        String result = targetDescription;
-        result += F(" is too large. max size is ");
-        result += len;
-        serialPrintln();
-        return return_result(event, result);
-      }
-      strcpy(target, TmpStr1.c_str());
-    }
-  }
-
-  if (hasArgument) {
-    serialPrintln();
-    String result = targetDescription;
-    result += target;
-    return return_result(event, result);
-  }
-  return return_command_success();
-}
-
-String Command_GetORSetBool(struct EventStruct *event,
-                            const String      & targetDescription,
-                            const char         *Line,
-                            bool               *value,
-                            int                 arg)
-{
-  bool hasArgument = false;
-  {
-    // Check if command is valid. Leave in separate scope to delete the TmpStr1
-    String TmpStr1;
-
-    if (GetArgv(Line, TmpStr1, arg + 1)) {
-      hasArgument = true;
-      TmpStr1.toLowerCase();
-
-      if (isInt(TmpStr1)) {
-        *value = atoi(TmpStr1.c_str()) > 0;
-      }
-      else if (strcmp_P(PSTR("on"), TmpStr1.c_str()) == 0) { *value = true; }
-      else if (strcmp_P(PSTR("true"), TmpStr1.c_str()) == 0) { *value = true; }
-      else if (strcmp_P(PSTR("off"), TmpStr1.c_str()) == 0) { *value = false; }
-      else if (strcmp_P(PSTR("false"), TmpStr1.c_str()) == 0) { *value = false; }
-    }
-  }
-
-  if (hasArgument) {
-    String result = targetDescription;
-    result += boolToString(*value);
-    return return_result(event, result);
-  }
-  return return_command_success();
-}
-
-String Command_GetORSetUint8_t(struct EventStruct *event,
-                            const String      & targetDescription,
-                            const char         *Line,
-                            uint8_t            *value,
-                            int                 arg)
-{
-  bool hasArgument = false;
-  {
-    // Check if command is valid. Leave in separate scope to delete the TmpStr1
-    String TmpStr1;
-
-    if (GetArgv(Line, TmpStr1, arg + 1)) {
-      hasArgument = true;
-      TmpStr1.toLowerCase();
-
-      if (isInt(TmpStr1)) {
-        *value = (uint8_t)atoi(TmpStr1.c_str());
-      }
-      else if (strcmp_P(PSTR("WIFI"), TmpStr1.c_str()) == 0) { *value = 0; }
-      else if (strcmp_P(PSTR("ETHERNET"), TmpStr1.c_str()) == 0) { *value = 1; }
-    }
-  }
-
-  if (hasArgument) {
-    String result = targetDescription;
-    result += *value;
-    return return_result(event, result);
-  }
-  return return_command_success();
-}
-
-String Command_GetORSetInt8_t(struct EventStruct *event,
-                            const String      & targetDescription,
-                            const char         *Line,
-                            int8_t             *value,
-                            int                 arg)
-{
-  bool hasArgument = false;
-  {
-    // Check if command is valid. Leave in separate scope to delete the TmpStr1
-    String TmpStr1;
-
-    if (GetArgv(Line, TmpStr1, arg + 1)) {
-      hasArgument = true;
-      TmpStr1.toLowerCase();
-
-      if (isInt(TmpStr1)) {
-        *value = (int8_t)atoi(TmpStr1.c_str());
-      }
-    }
-  }
-
-  if (hasArgument) {
-    String result = targetDescription;
-    result += *value;
-    return return_result(event, result);
-  }
-  return return_command_success();
-}
-
-#include "../Commands/Rules.h"
-
-
-#include "../../ESPEasy_common.h"
-
-
-#include "../Commands/Common.h"
-
-#include "../DataTypes/EventValueSource.h"
-
-#include "../ESPEasyCore/Controller.h"
-#include "../ESPEasyCore/ESPEasyRules.h"
-
-#include "../Globals/EventQueue.h"
 #include "../Globals/Settings.h"
 
+#include "../Helpers/_CPlugin_Helper.h"
 #include "../Helpers/Misc.h"
-#include "../Helpers/Rules_calculate.h"
-#include "../Helpers/StringConverter.h"
+#include "../Helpers/Networking.h"
+#include "../Helpers/StringParser.h"
 
-String Command_Rules_Execute(struct EventStruct *event, const char *Line)
+
+String Command_HTTP_SendToHTTP(struct EventStruct *event, const char* Line)
 {
-  String filename;
-
-  if (GetArgv(Line, filename, 2)) {
-    String event;
-    rulesProcessingFile(filename, event);
-  }
-  return return_command_success();
+	if (NetworkConnected()) {
+		String host = parseString(Line, 2);
+		const int port = parseCommandArgumentInt(Line, 2);
+		if (loglevelActiveFor(LOG_LEVEL_DEBUG)) {
+			String log = F("SendToHTTP: Host: ");
+			log += host;
+			log += F(" port: ");
+			log += port;
+			addLog(LOG_LEVEL_DEBUG, log);
+		}
+		if (port < 0 || port > 65535) return return_command_failed();
+		// FIXME TD-er: This is not using the tolerant settings option.
+    // String path = tolerantParseStringKeepCase(Line, 4);
+		String path = parseStringToEndKeepCase(Line, 4);
+#ifndef BUILD_NO_DEBUG
+		if (loglevelActiveFor(LOG_LEVEL_DEBUG)) {
+			String log = F("SendToHTTP: Path: ");
+			log += path;
+			addLog(LOG_LEVEL_DEBUG, log);
+		}
+#endif
+		WiFiClient client;
+		client.setTimeout(CONTROLLER_CLIENTTIMEOUT_MAX);
+		const bool connected = connectClient(client, host.c_str(), port);
+		if (connected) {
+			String hostportString = host;
+			if (port != 0 && port != 80) {
+				hostportString += ':';
+				hostportString += port;
+			}
+			String request = do_create_http_request(hostportString, F("GET"), path);
+#ifndef BUILD_NO_DEBUG
+			addLog(LOG_LEVEL_DEBUG, request);
+#endif
+            bool mustCheckAck = Settings.SendToHttp_ack();
+			send_via_http(F("Command_HTTP_SendToHTTP"), client, request, mustCheckAck);
+			return return_command_success();
+		}
+		addLog(LOG_LEVEL_ERROR, F("SendToHTTP connection failed"));
+	} else {
+		addLog(LOG_LEVEL_ERROR, F("SendToHTTP Not connected to network"));
+	}
+	return return_command_failed();
 }
 
-String Command_Rules_UseRules(struct EventStruct *event, const char *Line)
+#include "../Commands/i2c.h"
+
+#include "../Commands/Common.h"
+#include "../ESPEasyCore/Serial.h"
+
+#include "../Globals/I2Cdev.h"
+
+#include "../../ESPEasy_common.h"
+
+String Command_i2c_Scanner(struct EventStruct *event, const char* Line)
 {
-  return Command_GetORSetBool(event, F("Rules:"),
-                              Line,
-                              (bool *)&Settings.UseRules,
-                              1);
-}
-
-String Command_Rules_Async_Events(struct EventStruct *event, const char *Line)
-{
-  String eventName = parseStringToEndKeepCase(Line, 2);
-  eventName.replace('$', '#');
-
-  if (Settings.UseRules) {
-    eventQueue.add(eventName);
-  }
-  return return_command_success();
-}
-
-
-String Command_Rules_Events(struct EventStruct *event, const char *Line)
-{
-  String eventName = parseStringToEndKeepCase(Line, 2);
-  eventName.replace('$', '#');
-
-  if (Settings.UseRules) {
-    const bool executeImmediately = 
-        SourceNeedsStatusUpdate(event->Source) ||
-        event->Source == EventValueSource::Enum::VALUE_SOURCE_RULES;
-    if (executeImmediately) {
-      rulesProcessing(eventName); // TD-er: Process right now 
-    } else {
-      eventQueue.add(eventName);
-    }
-  }
-  return return_command_success();
-}
-
-String Command_Rules_Let(struct EventStruct *event, const char *Line)
-{
-  String TmpStr1;
-
-  if (GetArgv(Line, TmpStr1, 3)) {
-    float result = 0.0f;
-    Calculate(TmpStr1.c_str(), &result);
-    customFloatVar[event->Par1 - 1] = result;
-  }
-  return return_command_success();
+	byte error, address;
+	for (address = 1; address <= 127; address++) {
+		Wire.beginTransmission(address);
+		error = Wire.endTransmission();
+		if (error == 0) {
+			serialPrint(F("I2C  : Found 0x"));
+			serialPrintln(String(address, HEX));
+		}else if (error == 4) {
+			serialPrint(F("I2C  : Error at 0x"));
+			serialPrintln(String(address, HEX));
+		}
+	}
+	return return_see_serial(event);
 }
 
 #include "../Commands/InternalCommands.h"
@@ -2048,6 +1820,673 @@ bool ExecuteCommand(taskIndex_t            taskIndex,
   return false;
 }
 
+#include "../../ESPEasy_common.h"
+#include "../Globals/MQTT.h"
+
+#ifdef USES_MQTT
+
+
+
+#include "../Commands/Common.h"
+#include "../Commands/MQTT.h"
+
+#include "../ESPEasyCore/Controller.h"
+#include "../ESPEasyCore/ESPEasy_Log.h"
+
+#include "../Globals/CPlugins.h"
+#include "../Globals/ESPEasy_Scheduler.h"
+#include "../Globals/Settings.h"
+
+#include "../Helpers/ESPEasy_Storage.h"
+#include "../Helpers/PeriodicalActions.h"
+#include "../Helpers/Scheduler.h"
+#include "../Helpers/StringConverter.h"
+
+
+String Command_MQTT_Publish(struct EventStruct *event, const char *Line)
+{
+  // ToDo TD-er: Not sure about this function, but at least it sends to an existing MQTTclient
+  controllerIndex_t enabledMqttController = firstEnabledMQTT_ControllerIndex();
+
+  if (!validControllerIndex(enabledMqttController)) {
+    return F("No MQTT controller enabled");
+  }
+
+  // Command structure:  Publish,<topic>,<value>
+  String topic = parseStringKeepCase(Line, 2);
+  String value = tolerantParseStringKeepCase(Line, 3);
+  addLog(LOG_LEVEL_DEBUG, String(F("Publish: ")) + topic + value);
+
+  if ((topic.length() > 0) && (value.length() > 0)) {
+
+    bool mqtt_retainFlag;
+    {
+      // Place the ControllerSettings in a scope to free the memory as soon as we got all relevant information.
+      MakeControllerSettings(ControllerSettings);
+      if (!AllocatedControllerSettings()) {
+        String error = F("MQTT : Cannot publish, out of RAM");
+        addLog(LOG_LEVEL_ERROR, error);
+        return error;
+      }
+
+      LoadControllerSettings(enabledMqttController, ControllerSettings);
+      mqtt_retainFlag = ControllerSettings.mqtt_retainFlag();
+    }
+
+
+    // @giig1967g: if payload starts with '=' then treat it as a Formula and evaluate accordingly
+    // The evaluated value is already present in event->Par2
+    // FIXME TD-er: Is the evaluated value always present in event->Par2 ?
+    // Should it already be evaluated, or should we evaluate it now?
+
+    bool success = false;
+    if (value[0] != '=') {
+      success = MQTTpublish(enabledMqttController, topic.c_str(), value.c_str(), mqtt_retainFlag);
+    }
+    else {
+      success = MQTTpublish(enabledMqttController, topic.c_str(), String(event->Par2).c_str(), mqtt_retainFlag);
+    }
+    if (success) {
+      return return_command_success();
+    }
+  }
+  return return_command_failed();
+}
+
+
+boolean MQTTsubscribe(controllerIndex_t controller_idx, const char* topic, boolean retained)
+{
+  if (MQTTclient.subscribe(topic)) {
+    Scheduler.setIntervalTimerOverride(ESPEasy_Scheduler::IntervalTimer_e::TIMER_MQTT, 10); // Make sure the MQTT is being processed as soon as possible.
+    String log = F("Subscribed to: ");  log += topic;
+    addLog(LOG_LEVEL_INFO, log);
+    return true;
+  }
+  addLog(LOG_LEVEL_ERROR, F("MQTT : subscribe failed"));
+  return false;
+}
+
+String Command_MQTT_Subscribe(struct EventStruct *event, const char* Line)
+{
+  if (MQTTclient.connected() ) {
+    // ToDo TD-er: Not sure about this function, but at least it sends to an existing MQTTclient
+    controllerIndex_t enabledMqttController = firstEnabledMQTT_ControllerIndex();
+    if (validControllerIndex(enabledMqttController)) {
+      bool mqtt_retainFlag;
+      {
+        // Place the ControllerSettings in a scope to free the memory as soon as we got all relevant information.
+        MakeControllerSettings(ControllerSettings);
+        if (!AllocatedControllerSettings()) {
+          String error = F("MQTT : Cannot subscribe, out of RAM");
+          addLog(LOG_LEVEL_ERROR, error);
+          return error;
+        }
+        LoadControllerSettings(event->ControllerIndex, ControllerSettings);
+        mqtt_retainFlag = ControllerSettings.mqtt_retainFlag();
+      }
+
+      String eventName = Line;
+      String topic = eventName.substring(10);
+      if (!MQTTsubscribe(enabledMqttController, topic.c_str(), mqtt_retainFlag))
+         return_command_failed();
+      return_command_success();
+    }
+    return F("No MQTT controller enabled");
+  }
+  return return_not_connected();
+}
+
+
+#endif // ifdef USES_MQTT
+
+#include "../Commands/Networks.h"
+
+#include "../../ESPEasy_common.h"
+#include "../Commands/Common.h"
+#include "../Globals/Settings.h"
+#include "../WebServer/AccessControl.h"
+
+
+#ifdef HAS_ETHERNET
+#include "ETH.h"
+#endif
+
+String Command_AccessInfo_Ls(struct EventStruct *event, const char* Line)
+{
+  String result = F("Allowed IP range : ");
+  result += describeAllowedIPrange();
+  return return_result(event, result);
+}
+
+String Command_AccessInfo_Clear (struct EventStruct *event, const char* Line)
+{
+  clearAccessBlock();
+  return Command_AccessInfo_Ls(event, Line);
+}
+
+String Command_DNS (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetIP(event, F("DNS:"), Line, Settings.DNS,WiFi.dnsIP(0),1);
+}
+
+String Command_Gateway (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetIP(event, F("Gateway:"), Line, Settings.Gateway,WiFi.gatewayIP(),1);
+}
+
+String Command_IP (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetIP(event, F("IP:"), Line, Settings.IP,WiFi.localIP(),1);
+}
+
+String Command_Subnet (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetIP(event, F("Subnet:"), Line, Settings.Subnet,WiFi.subnetMask(),1);
+}
+
+#ifdef HAS_ETHERNET
+String Command_ETH_Phy_Addr (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetUint8_t(event, F("ETH_Phy_Addr:"), Line, (uint8_t*)&Settings.ETH_Phy_Addr,1);
+}
+
+String Command_ETH_Pin_mdc (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetInt8_t(event, F("ETH_Pin_mdc:"), Line, (int8_t*)&Settings.ETH_Pin_mdc,1);
+}
+
+String Command_ETH_Pin_mdio (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetInt8_t(event, F("ETH_Pin_mdio:"), Line, (int8_t*)&Settings.ETH_Pin_mdio,1);
+}
+
+String Command_ETH_Pin_power (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetInt8_t(event, F("ETH_Pin_power:"), Line, (int8_t*)&Settings.ETH_Pin_power,1);
+}
+
+String Command_ETH_Phy_Type (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetInt8_t(event, F("ETH_Phy_Type:"), Line, (int8_t*)&Settings.ETH_Phy_Type,1);
+}
+
+String Command_ETH_Clock_Mode (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetUint8_t(event, F("ETH_Clock_Mode:"), Line, (uint8_t*)&Settings.ETH_Clock_Mode,1);
+}
+
+String Command_ETH_IP (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetIP(event, F("ETH_IP:"), Line, Settings.ETH_IP,ETH.localIP(),1);
+}
+
+String Command_ETH_Gateway (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetIP(event, F("ETH_Gateway:"), Line, Settings.ETH_Gateway,ETH.gatewayIP(),1);
+}
+
+String Command_ETH_Subnet (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetIP(event, F("ETH_Subnet:"), Line, Settings.ETH_Subnet,ETH.subnetMask(),1);
+}
+
+String Command_ETH_DNS (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetIP(event, F("ETH_DNS:"), Line, Settings.ETH_DNS,ETH.dnsIP(),1);
+}
+
+String Command_ETH_Wifi_Mode (struct EventStruct *event, const char* Line)
+{
+  return Command_GetORSetUint8_t(event, F("NetworkMedium:"), Line, (uint8_t*)&Settings.NetworkMedium,1);
+}
+
+#endif
+
+#include "../Commands/Notifications.h"
+
+#include "../Commands/Common.h"
+
+#include "../../ESPEasy_common.h"
+#include "../DataTypes/ESPEasy_plugin_functions.h"
+#include "../Globals/ESPEasy_Scheduler.h"
+#include "../Globals/Settings.h"
+#include "../Globals/NPlugins.h"
+#include "../Helpers/StringConverter.h"
+
+
+String Command_Notifications_Notify(struct EventStruct *event, const char* Line)
+{
+	String message = "";
+	GetArgv(Line, message, 3);
+
+	if (event->Par1 > 0) {
+		int index = event->Par1 - 1;
+		if (Settings.NotificationEnabled[index] && Settings.Notification[index] != 0) {
+			nprotocolIndex_t NotificationProtocolIndex = getNProtocolIndex(Settings.Notification[index]);
+			if (validNProtocolIndex(NotificationProtocolIndex )) {
+				struct EventStruct TempEvent(event->TaskIndex);
+				// TempEvent.NotificationProtocolIndex = NotificationProtocolIndex;
+				TempEvent.NotificationIndex = index;
+				TempEvent.String1 = message;
+				Scheduler.schedule_notification_event_timer(NotificationProtocolIndex, NPlugin::Function::NPLUGIN_NOTIFY, &TempEvent);
+			}
+		}
+	}
+	return return_command_success();
+}
+
+#include "../Commands/RTC.h"
+
+#include "../../ESPEasy_common.h"
+
+
+#include "../Commands/Common.h"
+
+#include "../DataStructs/RTCStruct.h"
+
+#include "../Globals/RTC.h"
+
+#include "../Helpers/ESPEasyRTC.h"
+
+
+String Command_RTC_Clear(struct EventStruct *event, const char* Line)
+{
+	initRTC();
+	return return_command_success();
+}
+
+String Command_RTC_resetFlashWriteCounter(struct EventStruct *event, const char* Line)
+{
+	RTC.flashDayCounter = 0;
+	return return_command_success();
+}
+
+#include "../Commands/Rules.h"
+
+
+#include "../../ESPEasy_common.h"
+
+
+#include "../Commands/Common.h"
+
+#include "../DataTypes/EventValueSource.h"
+
+#include "../ESPEasyCore/Controller.h"
+#include "../ESPEasyCore/ESPEasyRules.h"
+
+#include "../Globals/EventQueue.h"
+#include "../Globals/Settings.h"
+
+#include "../Helpers/Misc.h"
+#include "../Helpers/Rules_calculate.h"
+#include "../Helpers/StringConverter.h"
+
+String Command_Rules_Execute(struct EventStruct *event, const char *Line)
+{
+  String filename;
+
+  if (GetArgv(Line, filename, 2)) {
+    String event;
+    rulesProcessingFile(filename, event);
+  }
+  return return_command_success();
+}
+
+String Command_Rules_UseRules(struct EventStruct *event, const char *Line)
+{
+  return Command_GetORSetBool(event, F("Rules:"),
+                              Line,
+                              (bool *)&Settings.UseRules,
+                              1);
+}
+
+String Command_Rules_Async_Events(struct EventStruct *event, const char *Line)
+{
+  String eventName = parseStringToEndKeepCase(Line, 2);
+  eventName.replace('$', '#');
+
+  if (Settings.UseRules) {
+    eventQueue.add(eventName);
+  }
+  return return_command_success();
+}
+
+
+String Command_Rules_Events(struct EventStruct *event, const char *Line)
+{
+  String eventName = parseStringToEndKeepCase(Line, 2);
+  eventName.replace('$', '#');
+
+  if (Settings.UseRules) {
+    const bool executeImmediately = 
+        SourceNeedsStatusUpdate(event->Source) ||
+        event->Source == EventValueSource::Enum::VALUE_SOURCE_RULES;
+    if (executeImmediately) {
+      rulesProcessing(eventName); // TD-er: Process right now 
+    } else {
+      eventQueue.add(eventName);
+    }
+  }
+  return return_command_success();
+}
+
+String Command_Rules_Let(struct EventStruct *event, const char *Line)
+{
+  String TmpStr1;
+
+  if (GetArgv(Line, TmpStr1, 3)) {
+    float result = 0.0f;
+    Calculate(TmpStr1.c_str(), &result);
+    customFloatVar[event->Par1 - 1] = result;
+  }
+  return return_command_success();
+}
+
+#include "../Commands/SDCARD.h"
+
+#include "../../ESPEasy_common.h"
+#include "../Commands/Common.h"
+#include "../ESPEasyCore/Serial.h"
+#include "../Globals/Settings.h"
+
+
+
+
+#ifdef FEATURE_SD
+
+#include <SD.h>
+
+
+void printDirectory(File dir, int numTabs)
+{
+  while (true) {
+    File entry = dir.openNextFile();
+
+    if (!entry) {
+      // no more files
+      break;
+    }
+
+    for (uint8_t i = 0; i < numTabs; i++) {
+      serialPrint("\t");
+    }
+    serialPrint(entry.name());
+
+    if (entry.isDirectory()) {
+      serialPrintln("/");
+      printDirectory(entry, numTabs + 1);
+    } else {
+      // files have sizes, directories do not
+      serialPrint("\t\t");
+      serialPrintln(String(entry.size(), DEC));
+    }
+    entry.close();
+  }
+}
+
+
+String Command_SD_LS(struct EventStruct *event, const char* Line)
+{
+  File root = SD.open("/");
+  root.rewindDirectory();
+  printDirectory(root, 0);
+  root.close();
+  return return_see_serial(event);
+}
+
+String Command_SD_Remove(struct EventStruct *event, const char* Line)
+{
+  // FIXME TD-er: This one is not using parseString* function
+  String fname = Line;
+  fname = fname.substring(9);
+  String result = F("Removing:");
+  result += fname.c_str();
+  SD.remove((char*)fname.c_str());
+  return return_result(event, result);
+}
+#endif
+
+#include "../Commands/Servo.h"
+
+#include "../Commands/Common.h"
+#include "../Commands/GPIO.h"
+#include "../DataStructs/EventStructCommandWrapper.h"
+#include "../DataStructs/PinMode.h"
+#include "../DataStructs/PortStatusStruct.h"
+#include "../ESPEasyCore/Controller.h"
+#include "../ESPEasyCore/ESPEasyGPIO.h"
+#include "../ESPEasyCore/ESPEasy_Log.h"
+#include "../Globals/GlobalMapPortStatus.h"
+#include "../Helpers/Hardware.h"
+#include "../Helpers/PortStatus.h"
+
+// Needed also here for PlatformIO's library finder as the .h file 
+// is in a directory which is excluded in the src_filter
+#ifdef USE_SERVO
+# ifdef ESP32
+#  include <Servo.h>
+# endif // ifdef ESP32
+#endif
+
+#ifdef USE_SERVO
+ServoPinMap_t ServoPinMap;
+#endif // ifdef USE_SERVO
+
+String Command_Servo(struct EventStruct *event, const char *Line)
+{
+#ifdef USE_SERVO
+
+  // GPIO number is stored inside event->Par2 instead of event->Par1 as in all the other commands
+  // So needs to reload the tempPortStruct.
+
+  // FIXME TD-er: For now only fixed to "P001" even when it is for internal GPIO pins
+  pluginID_t pluginID = PLUGIN_GPIO;
+
+  // Par1: Servo ID (obsolete/unused since 2020/11/22)
+  // Par2: GPIO pin
+  // Par3: angle 0...180 degree
+  if (checkValidPortRange(pluginID, event->Par2)) {
+    portStatusStruct tempStatus;
+    const uint32_t   key = createKey(pluginID, event->Par2); // WARNING: 'servo' uses Par2 instead of Par1
+    // WARNING: operator [] creates an entry in the map if key does not exist
+    // So the next command should be part of each command:
+    tempStatus = globalMapPortStatus[key];
+
+    String log = F("Servo : GPIO ");
+    log += event->Par2;
+
+    // SPECIAL CASE TO ALLOW SERVO TO BE DETATTCHED AND SAVE POWER.
+    if (event->Par3 >= 9000) {
+      auto it = ServoPinMap.find(event->Par2);
+
+      if (it != ServoPinMap.end()) {
+        it->second.detach();
+        # ifdef ESP32
+          detachLedChannel(event->Par2);
+        # endif // ifdef ESP32
+        ServoPinMap.erase(it);
+      }
+
+      // Set parameters to make sure the port status will be removed.
+      tempStatus.task    = 0;
+      tempStatus.monitor = 0;
+      tempStatus.command = 0;
+      savePortStatus(key, tempStatus);
+      log += F(" Servo detached");
+      addLog(LOG_LEVEL_INFO, log);
+      return return_command_success();
+
+    }
+    # ifdef ESP32
+      // Must keep track of used channels or else cause conflicts with PWM
+      int8_t ledChannel = attachLedChannel(event->Par2);
+      ServoPinMap[event->Par2].attach(event->Par2, ledChannel);
+    # else // ifdef ESP32
+      ServoPinMap[event->Par2].attach(event->Par2);
+    # endif // ifdef ESP32
+    ServoPinMap[event->Par2].write(event->Par3);
+
+    tempStatus.command   = 1; // set to 1 in order to display the status in the PinStatus page
+    tempStatus.state     = 1;
+    tempStatus.output    = 1;
+    tempStatus.dutyCycle = event->Par3;
+
+    // setPinState(PLUGIN_ID_001, event->Par2, PIN_MODE_SERVO, event->Par3);
+    tempStatus.mode = PIN_MODE_SERVO;
+    savePortStatus(key, tempStatus);
+    log += F(" Servo set to ");
+    log += event->Par3;
+    addLog(LOG_LEVEL_INFO, log);
+    SendStatusOnlyIfNeeded(event->Source, SEARCH_PIN_STATE, key, log, 0);
+
+    // SendStatus(event->Source, getPinStateJSON(SEARCH_PIN_STATE, PLUGIN_ID_001, event->Par2, log, 0));
+    return return_command_success();
+  }
+    #else // ifdef USE_SERVO
+  addLog(LOG_LEVEL_ERROR, F("USE_SERVO not included in build"));
+    #endif // USE_SERVO
+  return return_command_failed();
+}
+
+#include "../Commands/Settings.h"
+
+#include "../../ESPEasy_common.h"
+
+#include "../Commands/Common.h"
+
+#include "../ESPEasyCore/ESPEasyNetwork.h"
+#include "../ESPEasyCore/Serial.h"
+
+#include "../Globals/SecuritySettings.h"
+#include "../Globals/Settings.h"
+
+#include "../Helpers/ESPEasy_FactoryDefault.h"
+#include "../Helpers/ESPEasy_Storage.h"
+#include "../Helpers/Memory.h"
+#include "../Helpers/Misc.h"
+#include "../Helpers/StringConverter.h"
+
+
+String Command_Settings_Build(struct EventStruct *event, const char* Line)
+{
+	if (HasArgv(Line, 2)) {
+		Settings.Build = event->Par1;
+	} else {
+		serialPrintln();
+		String result = F("Build:");
+		result += Settings.Build;
+    return return_result(event, result);
+	}
+	return return_command_success();
+}
+
+String Command_Settings_Unit(struct EventStruct *event, const char* Line)
+{
+	if (HasArgv(Line, 2)) {
+		Settings.Unit = event->Par1;
+	}else  {
+		serialPrintln();
+		String result = F("Unit:");
+		result += Settings.Unit;
+    return return_result(event, result);
+	}
+	return return_command_success();
+}
+
+String Command_Settings_Name(struct EventStruct *event, const char* Line)
+{
+	return Command_GetORSetString(event, F("Name:"),
+				      Line,
+				      Settings.Name,
+				      sizeof(Settings.Name),
+				      1);
+}
+
+String Command_Settings_Password(struct EventStruct *event, const char* Line)
+{
+	return Command_GetORSetString(event, F("Password:"),
+				      Line,
+				      SecuritySettings.Password,
+				      sizeof(SecuritySettings.Password),
+				      1
+				      );
+}
+
+String Command_Settings_Save(struct EventStruct *event, const char* Line)
+{
+	SaveSettings();
+	return return_command_success();
+}
+
+String Command_Settings_Load(struct EventStruct *event, const char* Line)
+{
+	LoadSettings();
+	return return_command_success();
+}
+
+String Command_Settings_Print(struct EventStruct *event, const char* Line)
+{
+	serialPrintln();
+
+	serialPrintln(F("System Info"));
+	serialPrint(F("  IP Address    : ")); serialPrintln(NetworkLocalIP().toString());
+	serialPrint(F("  Build         : ")); serialPrintln(String((int)BUILD));
+	serialPrint(F("  Name          : ")); serialPrintln(Settings.Name);
+	serialPrint(F("  Unit          : ")); serialPrintln(String((int)Settings.Unit));
+	serialPrint(F("  WifiSSID      : ")); serialPrintln(SecuritySettings.WifiSSID);
+	serialPrint(F("  WifiKey       : ")); serialPrintln(SecuritySettings.WifiKey);
+	serialPrint(F("  WifiSSID2     : ")); serialPrintln(SecuritySettings.WifiSSID2);
+	serialPrint(F("  WifiKey2      : ")); serialPrintln(SecuritySettings.WifiKey2);
+	serialPrint(F("  Free mem      : ")); serialPrintln(String(FreeMem()));
+	return return_see_serial(event);
+}
+
+String Command_Settings_Reset(struct EventStruct *event, const char* Line)
+{
+	ResetFactory();
+	reboot(ESPEasy_Scheduler::IntendedRebootReason_e::ResetFactoryCommand);
+	return return_command_success();
+}
+
+#include "../Commands/System.h"
+
+#include "../../ESPEasy_common.h"
+
+
+#include "../Commands/Common.h"
+
+#include "../Globals/Settings.h"
+
+#include "../Helpers/DeepSleep.h"
+#include "../Helpers/Misc.h"
+#include "../Helpers/Scheduler.h"
+
+String Command_System_NoSleep(struct EventStruct *event, const char* Line)
+{
+	if (event->Par1 > 0)
+		Settings.deepSleep_wakeTime = event->Par1; // set deep Sleep awake time
+	else Settings.deepSleep_wakeTime = 0;
+	return return_command_success();
+}
+
+String Command_System_deepSleep(struct EventStruct *event, const char* Line)
+{
+	if (event->Par1 >= 0) {
+		deepSleepStart(event->Par1); // call the second part of the function to avoid check and enable one-shot operation
+	}
+	return return_command_success();
+}
+
+String Command_System_Reboot(struct EventStruct *event, const char* Line)
+{
+	pinMode(0, INPUT);
+	pinMode(2, INPUT);
+	pinMode(15, INPUT);
+	reboot(ESPEasy_Scheduler::IntendedRebootReason_e::CommandReboot);
+	return return_command_success();
+}
+
+
 #include "../Commands/Tasks.h"
 
 
@@ -2209,96 +2648,6 @@ String Command_Task_RemoteConfig(struct EventStruct *event, const char *Line)
   return return_command_success();
 }
 
-#include "../Commands/SDCARD.h"
-
-#include "../../ESPEasy_common.h"
-#include "../Commands/Common.h"
-#include "../ESPEasyCore/Serial.h"
-#include "../Globals/Settings.h"
-
-
-
-
-#ifdef FEATURE_SD
-
-#include <SD.h>
-
-
-void printDirectory(File dir, int numTabs)
-{
-  while (true) {
-    File entry = dir.openNextFile();
-
-    if (!entry) {
-      // no more files
-      break;
-    }
-
-    for (uint8_t i = 0; i < numTabs; i++) {
-      serialPrint("\t");
-    }
-    serialPrint(entry.name());
-
-    if (entry.isDirectory()) {
-      serialPrintln("/");
-      printDirectory(entry, numTabs + 1);
-    } else {
-      // files have sizes, directories do not
-      serialPrint("\t\t");
-      serialPrintln(String(entry.size(), DEC));
-    }
-    entry.close();
-  }
-}
-
-
-String Command_SD_LS(struct EventStruct *event, const char* Line)
-{
-  File root = SD.open("/");
-  root.rewindDirectory();
-  printDirectory(root, 0);
-  root.close();
-  return return_see_serial(event);
-}
-
-String Command_SD_Remove(struct EventStruct *event, const char* Line)
-{
-  // FIXME TD-er: This one is not using parseString* function
-  String fname = Line;
-  fname = fname.substring(9);
-  String result = F("Removing:");
-  result += fname.c_str();
-  SD.remove((char*)fname.c_str());
-  return return_result(event, result);
-}
-#endif
-
-#include "../Commands/RTC.h"
-
-#include "../../ESPEasy_common.h"
-
-
-#include "../Commands/Common.h"
-
-#include "../DataStructs/RTCStruct.h"
-
-#include "../Globals/RTC.h"
-
-#include "../Helpers/ESPEasyRTC.h"
-
-
-String Command_RTC_Clear(struct EventStruct *event, const char* Line)
-{
-	initRTC();
-	return return_command_success();
-}
-
-String Command_RTC_resetFlashWriteCounter(struct EventStruct *event, const char* Line)
-{
-	RTC.flashDayCounter = 0;
-	return return_command_success();
-}
-
 #include "../Commands/Time.h"
 
 
@@ -2399,547 +2748,224 @@ String Command_DateTime(struct EventStruct *event, const char *Line)
   return return_command_success();
 }
 
-#include "../Commands/Controller.h"
+#include "../Commands/Timer.h"
+
+
 
 
 #include "../../ESPEasy_common.h"
+
+
+#include "../Commands/Common.h"
+
+#include "../ESPEasyCore/ESPEasy_Log.h"
+#include "../ESPEasyCore/ESPEasyRules.h"
+
+#include "../Globals/ESPEasy_Scheduler.h"
+
+#include "../Helpers/ESPEasy_time_calc.h"
+#include "../Helpers/Misc.h"
+#include "../Helpers/Scheduler.h"
+
+String command_setRulesTimer(int msecFromNow, int timerIndex, int recurringCount) {
+  if (msecFromNow < 0)
+  {
+    addLog(LOG_LEVEL_ERROR, F("TIMER: time must be positive"));
+  } else {
+    // start new timer when msecFromNow > 0
+    // Clear timer when msecFromNow == 0
+    if (Scheduler.setRulesTimer(msecFromNow, timerIndex, recurringCount))
+    { 
+      return return_command_success();
+    }
+  }
+  return return_command_failed();
+}
+
+String Command_Timer_Set(struct EventStruct *event, const char *Line)
+{
+  return command_setRulesTimer(
+    event->Par2 * 1000, // msec from now
+    event->Par1,        // timer index
+    0                   // recurringCount
+    );
+}
+
+String Command_Timer_Set_ms (struct EventStruct *event, const char* Line)
+{
+  return command_setRulesTimer(
+    event->Par2, // interval
+    event->Par1, // timer index
+    0            // recurringCount
+    );
+}
+
+String Command_Loop_Timer_Set (struct EventStruct *event, const char* Line)
+{
+  int recurringCount = event->Par3;
+  if (recurringCount == 0) {
+    // if the optional 3rd parameter is not given, set it to "run always"
+    recurringCount = -1;
+  }
+  return command_setRulesTimer(
+    event->Par2 * 1000, // msec from now
+    event->Par1,        // timer index
+    recurringCount
+    );
+}
+
+String Command_Loop_Timer_Set_ms (struct EventStruct *event, const char* Line)
+{
+  int recurringCount = event->Par3;
+  if (recurringCount == 0) {
+    // if the optional 3rd parameter is not given, set it to "run always"
+    recurringCount = -1;
+  }
+  return command_setRulesTimer(
+    event->Par2, // interval
+    event->Par1, // timer index
+    recurringCount
+    );
+}
+
+String Command_Timer_Pause(struct EventStruct *event, const char *Line)
+{
+  if (Scheduler.pause_rules_timer(event->Par1)) {
+    String eventName = F("Rules#TimerPause=");
+    eventName += event->Par1;
+    rulesProcessing(eventName); // TD-er: Process right now
+    return return_command_success();
+  }
+  return return_command_failed();
+}
+
+String Command_Timer_Resume(struct EventStruct *event, const char *Line)
+{
+  if (Scheduler.resume_rules_timer(event->Par1)) {
+    String eventName = F("Rules#TimerResume=");
+    eventName += event->Par1;
+    rulesProcessing(eventName); // TD-er: Process right now
+    return return_command_success();
+  }
+  return return_command_failed();
+}
+
+String Command_Delay(struct EventStruct *event, const char *Line)
+{
+  delayBackground(event->Par1);
+  return return_command_success();
+}
+
+#include "../Commands/UPD.h"
+
+
+#include "../../ESPEasy_common.h"
+
+#include "../Commands/Common.h"
+#include "../ESPEasyCore/ESPEasyNetwork.h"
+#include "../Globals/NetworkState.h"
+#include "../Globals/Settings.h"
+#include "../Helpers/Misc.h"
+#include "../Helpers/Network.h"
+#include "../Helpers/Networking.h"
+#include "../Helpers/StringConverter.h"
+#include "../Helpers/StringParser.h"
+
+String Command_UDP_Test(struct EventStruct *event, const char *Line)
+{
+  for (byte x = 0; x < event->Par2; x++)
+  {
+    String eventName = "Test ";
+    eventName += x;
+    SendUDPCommand(event->Par1, eventName.c_str(), eventName.length());
+  }
+  return return_command_success();
+}
+
+String Command_UDP_Port(struct EventStruct *event, const char *Line)
+{
+  return Command_GetORSetBool(event, F("UDPPort:"),
+                              Line,
+                              (bool *)&Settings.UDPPort,
+                              1);
+}
+
+String Command_UPD_SendTo(struct EventStruct *event, const char *Line)
+{
+  int destUnit = parseCommandArgumentInt(Line, 1);
+  if ((destUnit > 0) && (destUnit < 255))
+  {
+    String eventName = tolerantParseStringKeepCase(Line, 3);
+    SendUDPCommand(destUnit, eventName.c_str(), eventName.length());
+  }
+  return return_command_success();
+}
+
+String Command_UDP_SendToUPD(struct EventStruct *event, const char *Line)
+{
+  if (NetworkConnected()) {
+    String ip      = parseString(Line, 2);
+    int port    = parseCommandArgumentInt(Line, 2);
+
+    if (port < 0 || port > 65535) return return_command_failed();
+    // FIXME TD-er: This command is not using the tolerance setting
+    // tolerantParseStringKeepCase(Line, 4);
+    String message = parseStringToEndKeepCase(Line, 4);
+    IPAddress UDP_IP;
+
+    if (UDP_IP.fromString(ip)) {
+      portUDP.beginPacket(UDP_IP, port);
+      #if defined(ESP8266)
+      portUDP.write(message.c_str(),            message.length());
+      #endif // if defined(ESP8266)
+      #if defined(ESP32)
+      portUDP.write((uint8_t *)message.c_str(), message.length());
+      #endif // if defined(ESP32)
+      portUDP.endPacket();
+    }
+    return return_command_success();
+  }
+  return return_not_connected();
+}
+
+#include "../Commands/wd.h"
 
 
 #include "../Commands/Common.h"
 
 #include "../DataStructs/ESPEasy_EventStruct.h"
 
-#include "../DataTypes/ControllerIndex.h"
-
-#include "../Globals/CPlugins.h"
-
-#include "../Helpers/Misc.h"
-
-//      controllerIndex = (event->Par1 - 1);   Par1 is here for 1 ... CONTROLLER_MAX
-bool validControllerVar(struct EventStruct *event, controllerIndex_t& controllerIndex)
-{
-  if (event->Par1 <= 0) { return false; }
-  controllerIndex = static_cast<controllerIndex_t>(event->Par1 - 1);
-  return validControllerIndex(controllerIndex);
-}
-
-String Command_Controller_Disable(struct EventStruct *event, const char *Line)
-{
-  controllerIndex_t controllerIndex;
-
-  if (validControllerVar(event, controllerIndex) && setControllerEnableStatus(controllerIndex, false)) {
-    return return_command_success();
-  }
-  return return_command_failed();
-}
-
-String Command_Controller_Enable(struct EventStruct *event, const char *Line)
-{
-  controllerIndex_t controllerIndex;
-
-  if (validControllerVar(event, controllerIndex) && setControllerEnableStatus(controllerIndex, true)) {
-    return return_command_success();
-  }
-  return return_command_failed();
-}
-
-#include "../Commands/Notifications.h"
-
-#include "../Commands/Common.h"
-
-#include "../../ESPEasy_common.h"
-#include "../DataTypes/ESPEasy_plugin_functions.h"
-#include "../Globals/ESPEasy_Scheduler.h"
-#include "../Globals/Settings.h"
-#include "../Globals/NPlugins.h"
-#include "../Helpers/StringConverter.h"
-
-
-String Command_Notifications_Notify(struct EventStruct *event, const char* Line)
-{
-	String message = "";
-	GetArgv(Line, message, 3);
-
-	if (event->Par1 > 0) {
-		int index = event->Par1 - 1;
-		if (Settings.NotificationEnabled[index] && Settings.Notification[index] != 0) {
-			nprotocolIndex_t NotificationProtocolIndex = getNProtocolIndex(Settings.Notification[index]);
-			if (validNProtocolIndex(NotificationProtocolIndex )) {
-				struct EventStruct TempEvent(event->TaskIndex);
-				// TempEvent.NotificationProtocolIndex = NotificationProtocolIndex;
-				TempEvent.NotificationIndex = index;
-				TempEvent.String1 = message;
-				Scheduler.schedule_notification_event_timer(NotificationProtocolIndex, NPlugin::Function::NPLUGIN_NOTIFY, &TempEvent);
-			}
-		}
-	}
-	return return_command_success();
-}
-
-#include "../Commands/Diagnostic.h"
-
-/*
- #include "Common.h"
- #include "../../ESPEasy_common.h"
- 
- #include "../DataStructs/ESPEasy_EventStruct.h"
- */
-
-#include "../../ESPEasy_fdwdecl.h"
-
-#include "../Commands/Common.h"
-
-#include "../DataStructs/PortStatusStruct.h"
-
-#include "../DataTypes/SettingsType.h"
-
-#include "../ESPEasyCore/ESPEasy_Log.h"
 #include "../ESPEasyCore/Serial.h"
 
-#include "../Globals/Device.h"
-#include "../Globals/ExtraTaskSettings.h"
-#include "../Globals/GlobalMapPortStatus.h"
-#include "../Globals/SecuritySettings.h"
-#include "../Globals/Settings.h"
-#include "../Globals/Statistics.h"
-
-#include "../Helpers/Convert.h"
-#include "../Helpers/ESPEasy_Storage.h"
-#include "../Helpers/ESPEasy_time_calc.h"
-#include "../Helpers/Misc.h"
-#include "../Helpers/PortStatus.h"
 #include "../Helpers/StringConverter.h"
-#include "../Helpers/StringParser.h"
-
-#include <map>
-#include <stdint.h>
 
 
-#ifndef BUILD_MINIMAL_OTA
-bool showSettingsFileLayout = false;
-#endif // ifndef BUILD_MINIMAL_OTA
-
-#ifndef BUILD_NO_DIAGNOSTIC_COMMANDS
-String Command_Lowmem(struct EventStruct *event, const char *Line)
+String Command_WD_Config(EventStruct *event, const char* Line)
 {
-  String result;
-
-  result += lowestRAM;
-  result += F(" : ");
-  result += lowestRAMfunction;
-  return return_result(event, result);
-}
-
-String Command_Malloc(struct EventStruct *event, const char *Line)
-{
-  char *ramtest;
-  int size = parseCommandArgumentInt(Line, 1);
-
-  ramtest = (char *)malloc(size);
-
-  if (ramtest == nullptr) { return return_command_failed(); }
-  free(ramtest);
+  Wire.beginTransmission(event->Par1);  // address
+  Wire.write(event->Par2);              // command
+  Wire.write(event->Par3);              // data
+  Wire.endTransmission();
   return return_command_success();
 }
 
-String Command_SysLoad(struct EventStruct *event, const char *Line)
+String Command_WD_Read(EventStruct *event, const char* Line)
 {
-  String result = toString(getCPUload(), 2);
-
-  result += F("% (LC=");
-  result += getLoopCountPerSec();
-  result += ')';
-  return return_result(event, result);
-}
-
-String Command_SerialFloat(struct EventStruct *event, const char *Line)
-{
-  pinMode(1, INPUT);
-  pinMode(3, INPUT);
-  delay(60000);
-  return return_command_success();
-}
-
-String Command_MemInfo(struct EventStruct *event, const char *Line)
-{
-  serialPrint(F("SecurityStruct         | "));
-  serialPrintln(String(sizeof(SecuritySettings)));
-  serialPrint(F("SettingsStruct         | "));
-  serialPrintln(String(sizeof(Settings)));
-  serialPrint(F("ExtraTaskSettingsStruct| "));
-  serialPrintln(String(sizeof(ExtraTaskSettings)));
-  serialPrint(F("DeviceStruct           | "));
-  serialPrintln(String(Device.size()));
-  return return_see_serial(event);
-}
-
-String Command_MemInfo_detail(struct EventStruct *event, const char *Line)
-{
-#ifndef BUILD_MINIMAL_OTA
-  showSettingsFileLayout = true;
-  Command_MemInfo(event, Line);
-
-  for (int st = 0; st < static_cast<int>(SettingsType::Enum::SettingsType_MAX); ++st) {
-    SettingsType::SettingsType::Enum settingsType = static_cast<SettingsType::Enum>(st);
-    int max_index, offset, max_size;
-    int struct_size = 0;
-    serialPrintln();
-    serialPrint(SettingsType::getSettingsTypeString(settingsType));
-    serialPrintln(F(" | start | end | max_size | struct_size"));
-    serialPrintln(F("--- | --- | --- | --- | ---"));
-    SettingsType::getSettingsParameters(settingsType, 0, max_index, offset, max_size, struct_size);
-
-    for (int i = 0; i < max_index; ++i) {
-      SettingsType::getSettingsParameters(settingsType, i, offset, max_size);
-      serialPrint(String(i));
-      serialPrint("|");
-      serialPrint(String(offset));
-      serialPrint("|");
-      serialPrint(String(offset + max_size - 1));
-      serialPrint("|");
-      serialPrint(String(max_size));
-      serialPrint("|");
-      serialPrintln(String(struct_size));
-    }
-  }
-  return return_see_serial(event);
-  #else
-  return return_command_failed();
-  #endif // ifndef BUILD_MINIMAL_OTA
-}
-
-String Command_Background(struct EventStruct *event, const char *Line)
-{
-  unsigned long timer = millis() + parseCommandArgumentInt(Line, 1);
-
-  serialPrintln(F("start"));
-
-  while (!timeOutReached(timer)) {
-    backgroundtasks();
-  }
-  serialPrintln(F("end"));
-  return return_see_serial(event);
-}
-#endif // BUILD_NO_DIAGNOSTIC_COMMANDS
-
-String Command_Debug(struct EventStruct *event, const char *Line)
-{
-  if (HasArgv(Line, 2)) {
-    setLogLevelFor(LOG_TO_SERIAL, parseCommandArgumentInt(Line, 1));
-  } else  {
-    serialPrintln();
-    serialPrint(F("Serial debug level: "));
-    serialPrintln(String(Settings.SerialLogLevel));
-  }
-  return return_see_serial(event);
-}
-
-String Command_logentry(struct EventStruct *event, const char *Line)
-{
-  // FIXME TD-er: Add an extra optional parameter to set log level.
-  addLog(LOG_LEVEL_INFO, tolerantParseStringKeepCase(Line, 2));
-  return return_command_success();
-}
-
-#ifndef BUILD_NO_DIAGNOSTIC_COMMANDS
-String Command_JSONPortStatus(struct EventStruct *event, const char *Line)
-{
-  addLog(LOG_LEVEL_INFO, F("JSON Port Status: Command not implemented yet."));
-  return return_command_success();
-}
-
-void createLogPortStatus(std::map<uint32_t, portStatusStruct>::iterator it)
-{  
-  String log = F("PortStatus detail: ");
-
-  log += F("Port=");
-  log += getPortFromKey(it->first);
-  log += F(" State=");
-  log += it->second.state;
-  log += F(" Output=");
-  log += it->second.output;
-  log += F(" Mode=");
-  log += it->second.mode;
-  log += F(" Task=");
-  log += it->second.task;
-  log += F(" Monitor=");
-  log += it->second.monitor;
-  log += F(" Command=");
-  log += it->second.command;
-  log += F(" Init=");
-  log += it->second.init;
-  log += F(" PreviousTask=");
-  log += it->second.previousTask;
-  addLog(LOG_LEVEL_INFO, log);
-}
-
-void debugPortStatus(std::map<uint32_t, portStatusStruct>::iterator it)
-{
-  createLogPortStatus(it);
-}
-
-void logPortStatus(const String& from) {
-  String log;
-
-  log  = F("PortStatus structure: Called from=");
-  log += from;
-  log += F(" Count=");
-  log += globalMapPortStatus.size();
-  addLog(LOG_LEVEL_INFO, log);
-
-  for (std::map<uint32_t, portStatusStruct>::iterator it = globalMapPortStatus.begin(); it != globalMapPortStatus.end(); ++it) {
-    debugPortStatus(it);
-  }
-}
-
-String Command_logPortStatus(struct EventStruct *event, const char *Line)
-{
-  logPortStatus("Rules");
-  return return_command_success();
-}
-#endif // BUILD_NO_DIAGNOSTIC_COMMANDS
-
-#include "../Commands/Blynk.h"
-
-#include "../../ESPEasy_fdwdecl.h"
-#include "../Commands/Common.h"
-#include "../DataStructs/ESPEasy_EventStruct.h"
-#include "../ESPEasyCore/ESPEasy_Log.h"
-#include "../Globals/Protocol.h"
-#include "../Globals/Settings.h"
-#include "../Helpers/_CPlugin_Helper.h"
-#include "../Helpers/ESPEasy_Storage.h"
-#include "../Helpers/ESPEasy_time_calc.h"
-
-
-#ifdef USES_C012
-
-controllerIndex_t firstEnabledBlynk_ControllerIndex() {
-  for (controllerIndex_t i = 0; i < CONTROLLER_MAX; ++i) {
-    protocolIndex_t ProtocolIndex = getProtocolIndex_from_ControllerIndex(i);
-
-    if (validProtocolIndex(ProtocolIndex)) {
-      if ((Protocol[ProtocolIndex].Number == 12) && Settings.ControllerEnabled[i]) {
-        return i;
-      }
-    }
-  }
-  return INVALID_CONTROLLER_INDEX;
-}
-
-String Command_Blynk_Get(struct EventStruct *event, const char *Line)
-{
-  controllerIndex_t first_enabled_blynk_controller = firstEnabledBlynk_ControllerIndex();
-
-  if (!validControllerIndex(first_enabled_blynk_controller)) {
-    return F("Controller not enabled");
-  } else {
-    // FIXME TD-er: This one is not using parseString* function
-    String strLine = Line;
-    strLine = strLine.substring(9);
-    int index = strLine.indexOf(',');
-
-    if (index > 0)
-    {
-      int index           = strLine.lastIndexOf(',');
-      String blynkcommand = strLine.substring(index + 1);
-      float  value        = 0;
-
-      if (Blynk_get(blynkcommand, first_enabled_blynk_controller, &value))
-      {
-        UserVar[(VARS_PER_TASK * (event->Par1 - 1)) + event->Par2 - 1] = value;
-      }
-      else {
-        return F("Error getting data");
-      }
-    }
-    else
-    {
-      if (!Blynk_get(strLine, first_enabled_blynk_controller, nullptr))
-      {
-        return F("Error getting data");
-      }
-    }
-  }
-  return return_command_success();
-}
-
-bool Blynk_get(const String& command, controllerIndex_t controllerIndex, float *data)
-{
-  bool MustCheckReply = false;
-  String hostname, pass;
-  unsigned int ClientTimeout = 0;
-  WiFiClient client;
-
+  Wire.beginTransmission(event->Par1);  // address
+  Wire.write(0x83);                     // command to set pointer
+  Wire.write(event->Par2);              // pointer value
+  Wire.endTransmission();
+  if ( Wire.requestFrom(static_cast<uint8_t>(event->Par1), static_cast<uint8_t>(1)) == 1 )
   {
-    // Place ControllerSettings in its own scope, as it is quite big.
-    MakeControllerSettings(ControllerSettings);
-    if (!AllocatedControllerSettings()) {
-      addLog(LOG_LEVEL_ERROR, F("Blynk : Cannot run GET, out of RAM"));
-      return false;
-    }
-
-    LoadControllerSettings(controllerIndex, ControllerSettings);
-    MustCheckReply = ControllerSettings.MustCheckReply;
-    hostname = ControllerSettings.getHost();
-    pass = getControllerPass(controllerIndex, ControllerSettings);
-    ClientTimeout = ControllerSettings.ClientTimeout;
-
-    if (pass.length() == 0) {
-      addLog(LOG_LEVEL_ERROR, F("Blynk : No password set"));
-      return false;
-    }
-
-    if (!try_connect_host(/* CPLUGIN_ID_012 */ 12, client, ControllerSettings)) {
-      return false;
-    }
+    byte value = Wire.read();
+    serialPrintln();
+    String result = F("I2C Read address ");
+    result += formatToHex(event->Par1);
+    result += F(" Value ");
+    result += formatToHex(value);
+    return return_result(event, result);
   }
-
-  // We now create a URI for the request
-  {
-    // Place this stack allocated array in its own scope, as it is quite big.
-    char request[300] = { 0 };
-    sprintf_P(request,
-              PSTR("GET /%s/%s HTTP/1.1\r\n Host: %s \r\n Connection: close\r\n\r\n"),
-              pass.c_str(),
-              command.c_str(),
-              hostname.c_str());
-    addLog(LOG_LEVEL_DEBUG, request);
-    client.print(request);
-  }
-  bool success = !MustCheckReply;
-
-  if (MustCheckReply || data) {
-    unsigned long timer = millis() + 200;
-
-    while (!client_available(client) && !timeOutReached(timer)) {
-      delay(1);
-    }
-
-    char log[80] = { 0 };
-    timer = millis() + 1500;
-
-    // Read all the lines of the reply from server and log them
-    while (client_available(client) && !success && !timeOutReached(timer)) {
-      String line;
-      safeReadStringUntil(client, line, '\n');
-      addLog(LOG_LEVEL_DEBUG_MORE, line);
-
-      // success ?
-      if (line.substring(0, 15) == F("HTTP/1.1 200 OK")) {
-        strcpy_P(log, PSTR("HTTP : Success"));
-
-        if (!data) { success = true; }
-      }
-      else if (line.substring(0, 24) == F("HTTP/1.1 400 Bad Request")) {
-        strcpy_P(log, PSTR("HTTP : Unauthorized"));
-      }
-      else if (line.substring(0, 25) == F("HTTP/1.1 401 Unauthorized")) {
-        strcpy_P(log, PSTR("HTTP : Unauthorized"));
-      }
-      addLog(LOG_LEVEL_DEBUG, log);
-
-      // data only
-      if (data && line.startsWith("["))
-      {
-        String strValue = line;
-        byte   pos      = strValue.indexOf('"', 2);
-        strValue = strValue.substring(2, pos);
-        strValue.trim();
-        float value = strValue.toFloat();
-        *data   = value;
-        success = true;
-
-        char value_char[5] = { 0 };
-        strValue.toCharArray(value_char, 5);
-        sprintf_P(log, PSTR("Blynk get - %s => %s"), command.c_str(), value_char);
-        addLog(LOG_LEVEL_DEBUG, log);
-      }
-      delay(0);
-    }
-  }
-  addLog(LOG_LEVEL_DEBUG, F("HTTP : closing connection (012)"));
-
-  client.flush();
-  client.stop();
-
-  // important - backgroundtasks - free mem
-  unsigned long timer = millis() + ClientTimeout;
-
-  while (!timeOutReached(timer)) {
-    backgroundtasks();
-  }
-
-  return success;
-}
-
-#endif // ifdef USES_C012
-
-#include "../Commands/HTTP.h"
-
-#include "../../ESPEasy_common.h"
-
-#include "../Commands/Common.h"
-
-#include "../DataStructs/ControllerSettingsStruct.h"
-#include "../DataStructs/SettingsStruct.h"
-
-#include "../ESPEasyCore/ESPEasy_Log.h"
-#include "../ESPEasyCore/ESPEasyNetwork.h"
-
-#include "../Globals/Settings.h"
-
-#include "../Helpers/_CPlugin_Helper.h"
-#include "../Helpers/Misc.h"
-#include "../Helpers/Networking.h"
-#include "../Helpers/StringParser.h"
-
-
-String Command_HTTP_SendToHTTP(struct EventStruct *event, const char* Line)
-{
-	if (NetworkConnected()) {
-		String host = parseString(Line, 2);
-		const int port = parseCommandArgumentInt(Line, 2);
-		if (loglevelActiveFor(LOG_LEVEL_DEBUG)) {
-			String log = F("SendToHTTP: Host: ");
-			log += host;
-			log += F(" port: ");
-			log += port;
-			addLog(LOG_LEVEL_DEBUG, log);
-		}
-		if (port < 0 || port > 65535) return return_command_failed();
-		// FIXME TD-er: This is not using the tolerant settings option.
-    // String path = tolerantParseStringKeepCase(Line, 4);
-		String path = parseStringToEndKeepCase(Line, 4);
-#ifndef BUILD_NO_DEBUG
-		if (loglevelActiveFor(LOG_LEVEL_DEBUG)) {
-			String log = F("SendToHTTP: Path: ");
-			log += path;
-			addLog(LOG_LEVEL_DEBUG, log);
-		}
-#endif
-		WiFiClient client;
-		client.setTimeout(CONTROLLER_CLIENTTIMEOUT_MAX);
-		const bool connected = connectClient(client, host.c_str(), port);
-		if (connected) {
-			String hostportString = host;
-			if (port != 0 && port != 80) {
-				hostportString += ':';
-				hostportString += port;
-			}
-			String request = do_create_http_request(hostportString, F("GET"), path);
-#ifndef BUILD_NO_DEBUG
-			addLog(LOG_LEVEL_DEBUG, request);
-#endif
-            bool mustCheckAck = Settings.SendToHttp_ack();
-			send_via_http(F("Command_HTTP_SendToHTTP"), client, request, mustCheckAck);
-			return return_command_success();
-		}
-		addLog(LOG_LEVEL_ERROR, F("SendToHTTP connection failed"));
-	} else {
-		addLog(LOG_LEVEL_ERROR, F("SendToHTTP Not connected to network"));
-	}
-	return return_command_failed();
+  return return_command_success();
 }
 
 #include "../Commands/WiFi.h"
@@ -3068,31 +3094,5 @@ String Command_WiFi_Erase(struct EventStruct *event, const char *Line)
   WifiDisconnect();       // this will store empty ssid/wpa into sdk storage
   WiFi.persistent(false); // Do not use SDK storage of SSID/WPA parameters
   return return_command_success();
-}
-
-#include "../Commands/i2c.h"
-
-#include "../Commands/Common.h"
-#include "../ESPEasyCore/Serial.h"
-
-#include "../Globals/I2Cdev.h"
-
-#include "../../ESPEasy_common.h"
-
-String Command_i2c_Scanner(struct EventStruct *event, const char* Line)
-{
-	byte error, address;
-	for (address = 1; address <= 127; address++) {
-		Wire.beginTransmission(address);
-		error = Wire.endTransmission();
-		if (error == 0) {
-			serialPrint(F("I2C  : Found 0x"));
-			serialPrintln(String(address, HEX));
-		}else if (error == 4) {
-			serialPrint(F("I2C  : Error at 0x"));
-			serialPrintln(String(address, HEX));
-		}
-	}
-	return return_see_serial(event);
 }
 

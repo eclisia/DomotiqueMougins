@@ -1,3 +1,59 @@
+#include "../ControllerQueue/C011_queue_element.h"
+
+#include "../DataStructs/ESPEasy_EventStruct.h"
+
+#ifdef USES_C011
+
+C011_queue_element::C011_queue_element() {}
+
+C011_queue_element::C011_queue_element(const struct EventStruct *event) :
+  idx(event->idx),
+  TaskIndex(event->TaskIndex),
+  controller_idx(event->ControllerIndex),
+  sensorType(event->sensorType) {}
+
+size_t C011_queue_element::getSize() const {
+  size_t total = sizeof(*this);
+  total += uri.length();
+  total += HttpMethod.length();
+  total += header.length();
+  total += postStr.length();
+  return total;
+}
+
+#endif
+
+#include "../ControllerQueue/C015_queue_element.h"
+
+#include "../DataStructs/ESPEasy_EventStruct.h"
+
+#ifdef USES_C015
+
+C015_queue_element::C015_queue_element() {}
+
+C015_queue_element::C015_queue_element(const struct EventStruct *event, byte value_count) :
+  idx(event->idx),
+  TaskIndex(event->TaskIndex),
+  controller_idx(event->ControllerIndex),
+  valuesSent(0),
+  valueCount(value_count) {}
+
+bool C015_queue_element::checkDone(bool succesfull) const {
+  if (succesfull) { ++valuesSent; }
+  return valuesSent >= valueCount || valuesSent >= VARS_PER_TASK;
+}
+
+size_t C015_queue_element::getSize() const {
+  size_t total = sizeof(*this);
+
+  for (int i = 0; i < VARS_PER_TASK; ++i) {
+    total += txt[i].length();
+  }
+  return total;
+}
+
+#endif
+
 #include "../ControllerQueue/C016_queue_element.h"
 
 #include "../DataStructs/ESPEasy_EventStruct.h"
@@ -26,6 +82,37 @@ C016_queue_element::C016_queue_element(const struct EventStruct *event, byte val
 
 size_t C016_queue_element::getSize() const {
   return sizeof(*this);
+}
+
+#endif
+
+#include "../ControllerQueue/C018_queue_element.h"
+
+#include "../DataStructs/ESPEasy_EventStruct.h"
+
+#include "../ESPEasyCore/ESPEasy_Log.h"
+
+#include "../Helpers/_CPlugin_LoRa_TTN_helper.h"
+
+#ifdef USES_C018
+
+C018_queue_element::C018_queue_element() {}
+
+C018_queue_element::C018_queue_element(struct EventStruct *event, uint8_t sampleSetCount) :
+  controller_idx(event->ControllerIndex)
+{
+    #ifdef USES_PACKED_RAW_DATA
+  packed = getPackedFromPlugin(event, sampleSetCount);
+  if (loglevelActiveFor(LOG_LEVEL_INFO)) {
+    String log = F("C018 queue element: ");
+    log += packed;
+    addLog(LOG_LEVEL_INFO, log);
+  }
+    #endif // USES_PACKED_RAW_DATA
+}
+
+size_t C018_queue_element::getSize() const {
+  return sizeof(*this) + packed.length();
 }
 
 #endif
@@ -217,62 +304,6 @@ DEFINE_Cxxx_DELAY_QUEUE_MACRO_CPP(0, 18)
 // When extending this, search for EXTEND_CONTROLLER_IDS 
 // in the code to find all places that need to be updated too.
 
-#include "../ControllerQueue/C011_queue_element.h"
-
-#include "../DataStructs/ESPEasy_EventStruct.h"
-
-#ifdef USES_C011
-
-C011_queue_element::C011_queue_element() {}
-
-C011_queue_element::C011_queue_element(const struct EventStruct *event) :
-  idx(event->idx),
-  TaskIndex(event->TaskIndex),
-  controller_idx(event->ControllerIndex),
-  sensorType(event->sensorType) {}
-
-size_t C011_queue_element::getSize() const {
-  size_t total = sizeof(*this);
-  total += uri.length();
-  total += HttpMethod.length();
-  total += header.length();
-  total += postStr.length();
-  return total;
-}
-
-#endif
-
-#include "../ControllerQueue/C018_queue_element.h"
-
-#include "../DataStructs/ESPEasy_EventStruct.h"
-
-#include "../ESPEasyCore/ESPEasy_Log.h"
-
-#include "../Helpers/_CPlugin_LoRa_TTN_helper.h"
-
-#ifdef USES_C018
-
-C018_queue_element::C018_queue_element() {}
-
-C018_queue_element::C018_queue_element(struct EventStruct *event, uint8_t sampleSetCount) :
-  controller_idx(event->ControllerIndex)
-{
-    #ifdef USES_PACKED_RAW_DATA
-  packed = getPackedFromPlugin(event, sampleSetCount);
-  if (loglevelActiveFor(LOG_LEVEL_INFO)) {
-    String log = F("C018 queue element: ");
-    log += packed;
-    addLog(LOG_LEVEL_INFO, log);
-  }
-    #endif // USES_PACKED_RAW_DATA
-}
-
-size_t C018_queue_element::getSize() const {
-  return sizeof(*this) + packed.length();
-}
-
-#endif
-
 #include "../ControllerQueue/MQTT_queue_element.h"
 
 
@@ -286,6 +317,36 @@ MQTT_queue_element::MQTT_queue_element(int ctrl_idx,
 
 size_t MQTT_queue_element::getSize() const {
   return sizeof(*this) + _topic.length() + _payload.length();
+}
+
+#include "../ControllerQueue/queue_element_formatted_uservar.h"
+
+#include "../DataStructs/ESPEasy_EventStruct.h"
+#include "../Helpers/StringConverter.h"
+#include "../../_Plugin_Helper.h"
+
+
+queue_element_formatted_uservar::queue_element_formatted_uservar() {}
+
+queue_element_formatted_uservar::queue_element_formatted_uservar(EventStruct *event) :
+  idx(event->idx),
+  TaskIndex(event->TaskIndex),
+  controller_idx(event->ControllerIndex),
+  sensorType(event->sensorType)
+{
+  valueCount = getValueCountForTask(TaskIndex);
+  for (byte i = 0; i < valueCount; ++i) {
+    txt[i] = formatUserVarNoCheck(event, i);
+  }
+}
+
+size_t queue_element_formatted_uservar::getSize() const {
+  size_t total = sizeof(*this);
+
+  for (int i = 0; i < VARS_PER_TASK; ++i) {
+    total += txt[i].length();
+  }
+  return total;
 }
 
 #include "../ControllerQueue/queue_element_single_value_base.h"
@@ -320,67 +381,6 @@ bool queue_element_single_value_base::checkDone(bool succesfull) const {
 }
 
 size_t queue_element_single_value_base::getSize() const {
-  size_t total = sizeof(*this);
-
-  for (int i = 0; i < VARS_PER_TASK; ++i) {
-    total += txt[i].length();
-  }
-  return total;
-}
-
-#include "../ControllerQueue/C015_queue_element.h"
-
-#include "../DataStructs/ESPEasy_EventStruct.h"
-
-#ifdef USES_C015
-
-C015_queue_element::C015_queue_element() {}
-
-C015_queue_element::C015_queue_element(const struct EventStruct *event, byte value_count) :
-  idx(event->idx),
-  TaskIndex(event->TaskIndex),
-  controller_idx(event->ControllerIndex),
-  valuesSent(0),
-  valueCount(value_count) {}
-
-bool C015_queue_element::checkDone(bool succesfull) const {
-  if (succesfull) { ++valuesSent; }
-  return valuesSent >= valueCount || valuesSent >= VARS_PER_TASK;
-}
-
-size_t C015_queue_element::getSize() const {
-  size_t total = sizeof(*this);
-
-  for (int i = 0; i < VARS_PER_TASK; ++i) {
-    total += txt[i].length();
-  }
-  return total;
-}
-
-#endif
-
-#include "../ControllerQueue/queue_element_formatted_uservar.h"
-
-#include "../DataStructs/ESPEasy_EventStruct.h"
-#include "../Helpers/StringConverter.h"
-#include "../../_Plugin_Helper.h"
-
-
-queue_element_formatted_uservar::queue_element_formatted_uservar() {}
-
-queue_element_formatted_uservar::queue_element_formatted_uservar(EventStruct *event) :
-  idx(event->idx),
-  TaskIndex(event->TaskIndex),
-  controller_idx(event->ControllerIndex),
-  sensorType(event->sensorType)
-{
-  valueCount = getValueCountForTask(TaskIndex);
-  for (byte i = 0; i < valueCount; ++i) {
-    txt[i] = formatUserVarNoCheck(event, i);
-  }
-}
-
-size_t queue_element_formatted_uservar::getSize() const {
   size_t total = sizeof(*this);
 
   for (int i = 0; i < VARS_PER_TASK; ++i) {
